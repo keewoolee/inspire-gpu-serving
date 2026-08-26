@@ -1,0 +1,19 @@
+[package]
+name = "pir-chain"
+version = "0.1.0"
+edition = "2021"
+description = "Ethereum chain follower: JSON-RPC block tracking, account-state fetch, and snapshot resync"
+
+[dependencies]
+pir-keyword = { path = "../keyword" }
+ureq = { version = "3.3", default-features = false, features = ["rustls", "json"] }
+serde_json = "1.0"
+log = "0.4"
+hex = "0.4"
+
+clap = { version = "4.5", features = ["derive"] }
+env_logger = "0.11"
+
+[[bin]]
+name = "resync"
+path = "src/bin/resync.rs"

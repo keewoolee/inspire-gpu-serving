@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/backend-ffi",
+    "crates/server",
+    "crates/client",
+    "crates/front",
+    "crates/keyword",
+    "crates/chain",
+]
+# `server` needs the GPU-linked backend (build it on a CUDA machine with
+# `cargo build -p pir-server`); everything else builds anywhere.
+default-members = [
+    "crates/backend-ffi",
+    "crates/client",
+    "crates/front",
+    "crates/keyword",
+    "crates/chain",
+]
+
+[profile.release]
+opt-level = 3
