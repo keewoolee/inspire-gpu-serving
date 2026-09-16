@@ -4,15 +4,27 @@
 //! `resync` tool.
 
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
 
 use pir_keyword::cuckoo::CuckooTable;
+
+/// Cap on a JSON-RPC response body. A block's state diff runs to tens of
+/// megabytes, far past ureq's 10 MiB default, which would otherwise stall the
+/// follower on exactly the busiest blocks.
+const MAX_RESPONSE_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Whether the endpoint serves `debug_traceBlockByNumber`, learned on first use.
+const DIFF_UNKNOWN: u8 = 0;
+const DIFF_YES: u8 = 1;
+const DIFF_NO: u8 = 2;
 
 /// Ethereum JSON-RPC client (synchronous, uses ureq).
 pub struct EthRpc {
     url: String,
     agent: ureq::Agent,
+    diff_support: AtomicU8,
 }
 
 /// State change extracted from a block: an address with its new balance and nonce.
@@ -28,6 +40,7 @@ impl EthRpc {
         Self {
             url: url.to_string(),
             agent,
+            diff_support: AtomicU8::new(DIFF_UNKNOWN),
         }
     }
 
@@ -44,8 +57,10 @@ impl EthRpc {
             .header("Content-Type", "application/json")
             .send_json(&body)
             .map_err(|e| format!("RPC request failed: {}", e))?;
-        let json: Value = resp
-            .into_body()
+        let mut body = resp.into_body();
+        let json: Value = body
+            .with_config()
+            .limit(MAX_RESPONSE_BYTES)
             .read_json()
             .map_err(|e| format!("RPC parse failed: {}", e))?;
         if let Some(err) = json.get("error") {
@@ -80,8 +95,10 @@ impl EthRpc {
             .header("Content-Type", "application/json")
             .send_json(&batch)
             .map_err(|e| format!("batch RPC failed: {}", e))?;
-        let json: Value = resp
-            .into_body()
+        let mut body = resp.into_body();
+        let json: Value = body
+            .with_config()
+            .limit(MAX_RESPONSE_BYTES)
             .read_json()
             .map_err(|e| format!("batch parse failed: {}", e))?;
 
@@ -193,9 +210,59 @@ impl EthRpc {
         Ok(updates)
     }
 
+    /// Fetch a block's account changes from a `prestateTracer` state diff.
+    ///
+    /// The diff names every account the EVM changed, so it catches value moved
+    /// inside a contract call and credited by a withdrawal, neither of which
+    /// appears in a transaction's `from` or `to`. It also carries the new
+    /// balance and nonce, so no follow-up reads are needed.
+    ///
+    /// `post` holds only the fields that changed, so an account whose balance
+    /// moved but whose nonce did not arrives without a nonce; each field falls
+    /// back to `pre`, which is that account's state entering the transaction.
+    /// Later transactions overwrite earlier ones, leaving the block's end state.
+    pub fn fetch_block_updates_via_diff(
+        &self,
+        block_num: u64,
+    ) -> Result<Vec<AccountUpdate>, String> {
+        let block_hex = format!("0x{:x}", block_num);
+        let config = json!({"tracer": "prestateTracer", "tracerConfig": {"diffMode": true}});
+        let result = self.call("debug_traceBlockByNumber", json!([block_hex, config]))?;
+        let traces = result.as_array().ok_or("trace result is not an array")?;
+        Ok(updates_from_prestate_diff(traces))
+    }
+
     /// Fetch a block and return all account state changes.
     /// Returns (block_number, updates).
+    ///
+    /// Prefers a state diff. An endpoint without the `debug` namespace falls
+    /// back to the addresses named by the block's transactions, which is
+    /// incomplete: measured against mainnet diffs it misses about a quarter of
+    /// the accounts a block changes, and those stay stale until their next
+    /// transaction. The fallback is decided once and remembered.
     pub fn fetch_block_updates(&self, block_num: u64) -> Result<(u64, Vec<AccountUpdate>), String> {
+        if self.diff_support.load(Ordering::Relaxed) != DIFF_NO {
+            match self.fetch_block_updates_via_diff(block_num) {
+                Ok(updates) => {
+                    if self.diff_support.swap(DIFF_YES, Ordering::Relaxed) == DIFF_UNKNOWN {
+                        eprintln!("chain: following state diffs (prestateTracer, diffMode)");
+                    }
+                    return Ok((block_num, updates));
+                }
+                Err(e) if is_unsupported_method(&e) => {
+                    if self.diff_support.swap(DIFF_NO, Ordering::Relaxed) != DIFF_NO {
+                        eprintln!(
+                            "chain: endpoint has no debug_traceBlockByNumber ({}); \
+                             falling back to transaction from/to, which misses accounts \
+                             changed inside contract calls",
+                            e
+                        );
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
         let block = self.get_block(block_num)?;
         let addresses = Self::addresses_from_block(&block);
 
@@ -504,6 +571,76 @@ fn parse_hex_u256(val: &Value) -> Vec<u8> {
     out
 }
 
+/// Fold a block's per-transaction prestate diffs into one update per account.
+///
+/// See `fetch_block_updates_via_diff` for why each field falls back to `pre`.
+fn updates_from_prestate_diff(traces: &[Value]) -> Vec<AccountUpdate> {
+    let mut state: HashMap<Vec<u8>, (Vec<u8>, u64)> = HashMap::new();
+    let mut order: Vec<Vec<u8>> = Vec::new();
+
+    for trace in traces {
+        // Each entry is {"txHash": ..., "result": {"pre": ..., "post": ...}},
+        // but a bare {"pre": ..., "post": ...} is tolerated too.
+        let inner = trace.get("result").unwrap_or(trace);
+        let post = match inner.get("post").and_then(|v| v.as_object()) {
+            Some(post) => post,
+            None => continue,
+        };
+        let pre = inner.get("pre").and_then(|v| v.as_object());
+
+        for (address_hex, changed) in post {
+            let address = match parse_hex_address(address_hex) {
+                Some(address) => address,
+                None => continue,
+            };
+            let before = pre.and_then(|pre| pre.get(address_hex));
+            let balance = pick_field(changed, before, "balance")
+                .map(parse_hex_u256)
+                .unwrap_or_else(|| vec![0u8; 32]);
+            let nonce = pick_field(changed, before, "nonce")
+                .and_then(parse_json_nonce)
+                .unwrap_or(0);
+            if state.insert(address.clone(), (balance, nonce)).is_none() {
+                order.push(address);
+            }
+        }
+    }
+
+    order
+        .into_iter()
+        .filter_map(|address| {
+            let (balance, nonce) = state.remove(&address)?;
+            Some(AccountUpdate {
+                address,
+                balance,
+                nonce,
+            })
+        })
+        .collect()
+}
+
+/// A field of a prestate diff entry, taken from the post state when the
+/// transaction changed it and from the pre state when it did not.
+fn pick_field<'a>(post: &'a Value, pre: Option<&'a Value>, field: &str) -> Option<&'a Value> {
+    post.get(field).or_else(|| pre.and_then(|pre| pre.get(field)))
+}
+
+/// A prestate nonce is a JSON number, unlike the hex quantities elsewhere in
+/// this API. Hex is accepted too, for endpoints that encode it that way.
+fn parse_json_nonce(val: &Value) -> Option<u64> {
+    if let Some(n) = val.as_u64() {
+        return Some(n);
+    }
+    let s = val.as_str()?;
+    u64::from_str_radix(s.strip_prefix("0x").unwrap_or(s), 16).ok()
+}
+
+/// Whether an RPC error means the method is absent or its namespace is off,
+/// as opposed to a real failure worth propagating.
+fn is_unsupported_method(err: &str) -> bool {
+    err.contains("-32601") || err.contains("Method not found")
+}
+
 fn parse_hex_address(s: &str) -> Option<Vec<u8>> {
     let s = s.strip_prefix("0x").unwrap_or(s);
     if s.len() != 40 {
@@ -557,5 +694,96 @@ mod tests {
         let nonce = u64::from_be_bytes(value[32..40].try_into().unwrap());
         assert_eq!(balance, 660_443_672_139_059_381);
         assert_eq!(nonce, 116_692);
+    }
+
+    const A: &str = "0x1111111111111111111111111111111111111111";
+    const B: &str = "0x2222222222222222222222222222222222222222";
+    const C: &str = "0x3333333333333333333333333333333333333333";
+
+    fn balance_of(update: &AccountUpdate) -> u128 {
+        u128::from_be_bytes(update.balance[16..32].try_into().unwrap())
+    }
+
+    fn find<'a>(updates: &'a [AccountUpdate], address_hex: &str) -> &'a AccountUpdate {
+        let want = parse_hex_address(address_hex).unwrap();
+        updates
+            .iter()
+            .find(|u| u.address == want)
+            .unwrap_or_else(|| panic!("no update for {address_hex}"))
+    }
+
+    /// post carries only what the transaction changed, so every other field has
+    /// to come from pre. Reading a missing nonce as zero would roll accounts back.
+    #[test]
+    fn diff_takes_unchanged_fields_from_pre() {
+        let traces = [json!({
+            "txHash": "0xaa",
+            "result": {
+                "pre":  { A: {"balance": "0x64", "nonce": 7},
+                          B: {"balance": "0x5",  "nonce": 3} },
+                // A spent, so only its balance moved; B only touched storage.
+                "post": { A: {"balance": "0xc8"},
+                          B: {"storage": {"0x00": "0x01"}} },
+            }
+        })];
+        let updates = updates_from_prestate_diff(&traces);
+        assert_eq!(updates.len(), 2);
+        assert_eq!(balance_of(find(&updates, A)), 200);
+        assert_eq!(find(&updates, A).nonce, 7);
+        assert_eq!(balance_of(find(&updates, B)), 5);
+        assert_eq!(find(&updates, B).nonce, 3);
+    }
+
+    /// An account can have its balance changed by one transaction and its nonce
+    /// by a later one. Each field must end on the last value the block gave it.
+    #[test]
+    fn diff_folds_changes_across_transactions() {
+        let traces = [
+            json!({"result": {
+                "pre":  { A: {"balance": "0x64", "nonce": 7} },
+                "post": { A: {"balance": "0xc8", "nonce": 8} },
+            }}),
+            json!({"result": {
+                "pre":  { A: {"balance": "0xc8", "nonce": 8} },
+                "post": { A: {"nonce": 9} },
+            }}),
+        ];
+        let updates = updates_from_prestate_diff(&traces);
+        assert_eq!(updates.len(), 1, "one update per account, not per transaction");
+        assert_eq!(balance_of(&updates[0]), 200);
+        assert_eq!(updates[0].nonce, 9);
+    }
+
+    /// An account created by the block appears in post with no pre entry.
+    #[test]
+    fn diff_handles_accounts_absent_from_pre() {
+        let traces = [json!({"result": {
+            "pre":  {},
+            "post": { C: {"balance": "0x1", "nonce": 0} },
+        }})];
+        let updates = updates_from_prestate_diff(&traces);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(balance_of(&updates[0]), 1);
+        assert_eq!(updates[0].nonce, 0);
+    }
+
+    /// Tolerate a trace entry that is the diff itself rather than {txHash, result}.
+    #[test]
+    fn diff_accepts_an_unwrapped_entry() {
+        let traces = [json!({
+            "pre":  { A: {"balance": "0x64", "nonce": 7} },
+            "post": { A: {"balance": "0x92a5e054800d0b5"} },
+        })];
+        let updates = updates_from_prestate_diff(&traces);
+        assert_eq!(balance_of(&updates[0]), 660_443_672_139_059_381);
+        assert_eq!(updates[0].nonce, 7);
+    }
+
+    #[test]
+    fn unsupported_method_is_recognized() {
+        assert!(is_unsupported_method(
+            "RPC error: {\"code\":-32601,\"message\":\"Method not found: debug_traceBlockByNumber\"}"
+        ));
+        assert!(!is_unsupported_method("RPC error: {\"code\":-32000}"));
     }
 }
