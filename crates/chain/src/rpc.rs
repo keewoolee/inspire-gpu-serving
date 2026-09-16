@@ -475,8 +475,25 @@ fn parse_hex_u256(val: &Value) -> Vec<u8> {
         None => return vec![0u8; 32],
     };
     let s = s.strip_prefix("0x").unwrap_or(s);
-    // Decode hex to bytes, left-pad to 32 bytes
-    let raw = hex::decode(s).unwrap_or_default();
+    // JSON-RPC encodes quantities as minimal hex with no leading zeros, so the
+    // digit count is odd whenever the leading nibble is nonzero. hex::decode
+    // rejects odd-length input, so pad it back to a whole number of bytes.
+    let padded;
+    let s = if s.len() % 2 == 1 {
+        padded = format!("0{}", s);
+        padded.as_str()
+    } else {
+        s
+    };
+    // Decode hex to bytes, left-pad to 32 bytes. A failure here means the node
+    // sent something that is not a quantity, which must not pass silently.
+    let raw = match hex::decode(s) {
+        Ok(raw) => raw,
+        Err(e) => {
+            eprintln!("bad hex u256 {:?}: {} (reading as zero)", s, e);
+            return vec![0u8; 32];
+        }
+    };
     let mut out = vec![0u8; 32];
     if raw.len() <= 32 {
         out[32 - raw.len()..].copy_from_slice(&raw);
@@ -493,4 +510,52 @@ fn parse_hex_address(s: &str) -> Option<Vec<u8>> {
         return None;
     }
     hex::decode(s).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn u256(hex: &str) -> u128 {
+        let v = parse_hex_u256(&json!(hex));
+        u128::from_be_bytes(v[16..32].try_into().unwrap())
+    }
+
+    /// Quantities arrive as minimal hex, so half of them have an odd digit
+    /// count. Decoding those must not silently yield zero.
+    #[test]
+    fn parses_minimal_hex_quantities() {
+        assert_eq!(u256("0x0"), 0);
+        assert_eq!(u256("0x1"), 1);
+        assert_eq!(u256("0xff"), 255);
+        assert_eq!(u256("0xdc6"), 0xdc6);
+        assert_eq!(u256("0x92a5e054800d0b5"), 660_443_672_139_059_381);
+        assert_eq!(u256("0x173a75fcf49e44a7c"), 26_780_479_053_084_510_844);
+        assert_eq!(u256("0xde0b6b3a7640000"), 1_000_000_000_000_000_000);
+    }
+
+    #[test]
+    fn parse_hex_u256_is_big_endian_right_aligned() {
+        let v = parse_hex_u256(&json!("0x1"));
+        assert_eq!(v.len(), 32);
+        assert_eq!(v[31], 1);
+        assert!(v[..31].iter().all(|&b| b == 0));
+    }
+
+    /// An account value round-trips through the layout the client decodes.
+    #[test]
+    fn account_value_round_trips_balance_and_nonce() {
+        let update = AccountUpdate {
+            address: vec![0xab; 20],
+            balance: parse_hex_u256(&json!("0x92a5e054800d0b5")),
+            nonce: 116_692,
+        };
+        let value = account_update_to_value(&update);
+        assert_eq!(value.len(), 40);
+        let balance = u128::from_be_bytes(value[16..32].try_into().unwrap());
+        let nonce = u64::from_be_bytes(value[32..40].try_into().unwrap());
+        assert_eq!(balance, 660_443_672_139_059_381);
+        assert_eq!(nonce, 116_692);
+    }
 }
