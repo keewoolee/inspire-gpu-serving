@@ -59,11 +59,23 @@ struct Args {
 
     /// How far below the chain head to stamp the snapshot. The table trails the
     /// node, because state settles into it a layer at a time rather than a block
-    /// at a time, so the stamp is deliberately pessimistic and the follower
-    /// replays the difference. Sampling active mainnet accounts put the lag at
-    /// 128 blocks every time, so the default leaves an order of magnitude spare.
-    #[clap(long, default_value_t = 2048)]
+    /// at a time, and sampling accounts that had just changed put that lag at
+    /// exactly 128 blocks. A larger margin is not safer: a node keeps 128 blocks
+    /// of state history, so it cannot trace further back than that either, and
+    /// a stamp below the window leaves the follower with blocks it can never
+    /// replay. The two numbers are the same depth, so 128 is both the floor and
+    /// the ceiling.
+    #[clap(long, default_value_t = 128)]
     margin: u64,
+
+    /// Skip accounts holding less than this many wei. `--min-balance 1` drops
+    /// the ones that hold nothing, which is about half of them, and halves the
+    /// table with it. The cost is that a client asking about a dropped account
+    /// gets non-membership rather than its nonce; such an account cannot pay
+    /// for a transaction anyway, and it rejoins the served set through the
+    /// sidecar the moment it receives anything.
+    #[clap(long, default_value_t = 0)]
+    min_balance: u128,
 
     /// Stop after this many accounts. For checking the output before committing
     /// to a full scan.
@@ -126,12 +138,20 @@ fn main() {
         }
     };
     let mut out = BufWriter::with_capacity(16 << 20, file);
+    // Every comment goes above the column header, and none of them may contain
+    // a column name: the loader treats the first line mentioning one as the
+    // header row.
     writeln!(out, "# block={stamp}").unwrap();
-    writeln!(out, "# key is the first 20 bytes of keccak256(address)").unwrap();
+    // The server reads this and publishes it in the manifest, so a client
+    // derives keys the same way without being told.
+    writeln!(out, "# key_derivation=keccak").unwrap();
+    if args.min_balance > 0 {
+        writeln!(out, "# accounts holding under {} wei are left out", args.min_balance).unwrap();
+    }
     writeln!(out, "address,nonce,balance_wei").unwrap();
 
     let t0 = Instant::now();
-    let (mut written, mut skipped) = (0u64, 0u64);
+    let (mut written, mut skipped, mut filtered) = (0u64, 0u64, 0u64);
 
     for item in db.iterator_cf(&cf, IteratorMode::Start) {
         let (key, value) = match item {
@@ -155,6 +175,10 @@ fn main() {
                 continue;
             }
         };
+        if balance < args.min_balance {
+            filtered += 1;
+            continue;
+        }
         writeln!(out, "{},{},{}", hex::encode(&hash[..20]), nonce, balance).unwrap();
 
         written += 1;
@@ -174,10 +198,21 @@ fn main() {
     out.flush().unwrap();
     let secs = t0.elapsed().as_secs_f64();
     println!(
-        "wrote {written} accounts to {} in {:.1} min ({skipped} entries skipped)",
+        "wrote {written} accounts to {} in {:.1} min",
         args.out.display(),
         secs / 60.0
     );
+    if filtered > 0 {
+        let seen = written + filtered;
+        println!(
+            "  {filtered} of {seen} held less than {} wei and were left out ({:.1}%)",
+            args.min_balance,
+            100.0 * filtered as f64 / seen as f64
+        );
+    }
+    if skipped > 0 {
+        println!("  {skipped} entries could not be read");
+    }
 }
 
 /// Open every column family read-only next to the running node.

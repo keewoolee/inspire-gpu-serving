@@ -259,7 +259,20 @@ impl EthRpc {
                         );
                     }
                 }
-                Err(e) => return Err(e),
+                // A block older than the node's state history cannot be traced,
+                // which is what catching up from a snapshot runs into: the
+                // snapshot sits at the far edge of that window and the window
+                // moves on while the snapshot loads. Take the weaker source for
+                // this block rather than stalling on it, and say so, because
+                // accounts changed inside a contract call go unseen until they
+                // are touched again. Later blocks are tried as diffs as usual.
+                Err(e) => {
+                    eprintln!(
+                        "chain: block #{block_num} could not be traced ({e}); \
+                         using transaction from/to for it, which misses accounts \
+                         changed inside contract calls"
+                    );
+                }
             }
         }
 
