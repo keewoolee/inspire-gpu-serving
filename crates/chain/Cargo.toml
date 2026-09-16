@@ -14,6 +14,22 @@ hex = "0.4"
 clap = { version = "4.5", features = ["derive"] }
 env_logger = "0.11"
 
+# Only the statedump binary needs this, and building it compiles RocksDB from
+# source, so it stays behind a feature the default build never turns on.
+# Building this compiles RocksDB from source and needs libclang for the
+# bindings, so it stays behind a feature the default build never turns on.
+rocksdb = { version = "0.24", optional = true, default-features = false, features = ["lz4"] }
+sha3 = { version = "0.11", optional = true }
+
+[features]
+# Read a full account snapshot straight out of an ethrex node's database.
+ethrex-dump = ["dep:rocksdb", "dep:sha3"]
+
 [[bin]]
 name = "resync"
 path = "src/bin/resync.rs"
+
+[[bin]]
+name = "ethrex-statedump"
+path = "src/bin/ethrex_statedump.rs"
+required-features = ["ethrex-dump"]
