@@ -8,6 +8,35 @@
 use crate::cuckoo::CuckooHash;
 use serde::{Deserialize, Serialize};
 
+/// How a lookup key is derived from an account address. A client has to agree
+/// with the table it is querying, so the server publishes which one is in use
+/// rather than leaving it to be configured on both sides.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum KeyDerivation {
+    /// The address itself.
+    #[default]
+    Address,
+    /// keccak256 of the address, cut to the key size. A snapshot read out of a
+    /// node's state trie arrives this way, because the trie is keyed by that
+    /// hash and a hash cannot be turned back into an address. It costs the
+    /// client nothing, since it knows the address it is asking about.
+    Keccak,
+}
+
+impl KeyDerivation {
+    /// The lookup key for `address` under this derivation.
+    pub fn key(&self, address: &[u8], key_size: usize) -> Vec<u8> {
+        match self {
+            KeyDerivation::Address => address.to_vec(),
+            KeyDerivation::Keccak => {
+                use sha3::Digest;
+                sha3::Keccak256::digest(address)[..key_size.min(32)].to_vec()
+            }
+        }
+    }
+}
+
 /// Cuckoo-hashing side: lets the client map an address to its two candidate
 /// bucket indices (= PIR entry indices).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -20,6 +49,10 @@ pub struct CuckooManifest {
     pub num_hashes: usize,
     /// 16-byte SipHash seed, hex.
     pub seed_hex: String,
+    /// Absent in a manifest written before this was published, which could
+    /// only have been an address-keyed table.
+    #[serde(default)]
+    pub key_derivation: KeyDerivation,
 }
 
 impl CuckooManifest {
@@ -163,6 +196,7 @@ mod tests {
                 bucket_capacity: 2,
                 num_hashes: 2,
                 seed_hex: hex::encode(DETERMINISTIC_SEED),
+                key_derivation: KeyDerivation::Address,
             },
             pir: PirManifest {
                 n_entries: 1 << 27,
@@ -202,5 +236,40 @@ mod tests {
         };
         let b2 = SidecarBroadcast::from_json(&b.to_json()).unwrap();
         assert_eq!(b, b2);
+    }
+
+    /// A manifest written before key_derivation existed can only describe an
+    /// address-keyed table, and has to keep loading.
+    #[test]
+    fn a_manifest_without_key_derivation_reads_as_address() {
+        let json = r#"{"num_buckets":16,"key_size":20,"value_size":40,
+            "bucket_capacity":2,"num_hashes":2,"seed_hex":"00"}"#;
+        let c: CuckooManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(c.key_derivation, KeyDerivation::Address);
+    }
+
+    #[test]
+    fn key_derivation_names_are_stable_on_the_wire() {
+        assert_eq!(
+            serde_json::to_string(&KeyDerivation::Keccak).unwrap(),
+            "\"keccak\""
+        );
+        assert_eq!(
+            serde_json::to_string(&KeyDerivation::Address).unwrap(),
+            "\"address\""
+        );
+    }
+
+    /// The address derivation hands the address back; the keccak one hands back
+    /// the hash the state trie is keyed by, cut to the key size.
+    #[test]
+    fn derivations_produce_the_keys_the_tables_are_built_with() {
+        // keccak256 of vitalik.eth's address, as the trie stores it.
+        let address = hex::decode("d8da6bf26964af9d7eed9e03e53415d37aa96045").unwrap();
+        assert_eq!(KeyDerivation::Address.key(&address, 20), address);
+        assert_eq!(
+            hex::encode(KeyDerivation::Keccak.key(&address, 20)),
+            "06e120c2c3547c60ee47f712d32e5acf38b35d1c"
+        );
     }
 }

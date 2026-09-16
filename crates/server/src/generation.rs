@@ -109,8 +109,22 @@ impl GenerationBuilder {
     /// Apply one key-value change to the host-side truth (table + slot
     /// matrix). Takes effect in the NEXT built generation; until then the
     /// sidecar carries it to clients.
-    pub fn apply_update(&mut self, address: &[u8], value: &[u8]) {
-        for bucket in self.table.upsert(address, value) {
+    /// Apply an account's new value, deriving its key the way this table is
+    /// keyed, and hand the key back because the sidecar has to carry the same
+    /// one. Always reach for this rather than `apply_update` when what you
+    /// hold is an address: a table keyed by address hashes takes a raw address
+    /// as a different account and quietly grows a second copy of it.
+    pub fn apply_account(&mut self, address: &[u8], value: &[u8]) -> Vec<u8> {
+        let params = &self.table.params;
+        let key = params.key_derivation.key(address, params.key_size);
+        self.apply_update(&key, value);
+        key
+    }
+
+    /// Apply a value under a key that is already derived. The canary is a
+    /// reserved key rather than an account, so it goes in as itself.
+    pub fn apply_update(&mut self, key: &[u8], value: &[u8]) {
+        for bucket in self.table.upsert(key, value) {
             write_bucket_to_slot_db(
                 &mut self.slot_db,
                 bucket,
@@ -172,6 +186,7 @@ impl GenerationBuilder {
                 bucket_capacity: self.table.params.bucket_capacity,
                 num_hashes: self.table.params.num_hashes,
                 seed_hex: hex::encode(self.table.params.seed),
+                key_derivation: self.table.params.key_derivation,
             },
             pir: srv.params().to_manifest(),
         };

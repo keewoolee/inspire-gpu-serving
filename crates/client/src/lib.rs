@@ -62,6 +62,11 @@ pub fn parse_account_value(v: &[u8]) -> Option<AccountValue> {
     })
 }
 
+/// Cap on a response body. A lookup carries the whole sidecar broadcast, which
+/// grows with every block until the next generation flip folds it in, so the
+/// 10 MiB default trips exactly when a server is catching up.
+const MAX_RESPONSE_BYTES: u64 = 128 * 1024 * 1024;
+
 pub struct PirClient {
     base: String,
     pub manifest: Manifest,
@@ -92,6 +97,8 @@ impl PirClient {
             .map_err(|e| format!("manifest fetch failed: {}", e))?;
         let body = resp
             .body_mut()
+            .with_config()
+            .limit(MAX_RESPONSE_BYTES)
             .read_to_string()
             .map_err(|e| e.to_string())?;
         let manifest = Manifest::from_json(&body)?;
@@ -126,6 +133,17 @@ impl PirClient {
 
     /// Private lookup: one POST carrying both bucket queries. Retries once
     /// through a manifest refresh if the server was reconfigured.
+    /// Look up an account by address, deriving the key the way the served
+    /// table was built. Prefer this over `lookup` unless you already hold a
+    /// key: a snapshot read out of a node's state trie is keyed by the hash of
+    /// the address, and querying such a table with a raw address quietly finds
+    /// nothing rather than failing.
+    pub fn lookup_address(&mut self, address: &[u8]) -> Result<Option<Lookup>, String> {
+        let cuckoo = &self.manifest.cuckoo;
+        let key = cuckoo.key_derivation.key(address, cuckoo.key_size);
+        self.lookup(&key)
+    }
+
     pub fn lookup(&mut self, key: &[u8]) -> Result<Option<Lookup>, String> {
         match self.lookup_once(key)? {
             LookupOutcome::Done(r) => Ok(r),
@@ -167,6 +185,8 @@ impl PirClient {
         }
         let bytes = resp
             .body_mut()
+            .with_config()
+            .limit(MAX_RESPONSE_BYTES)
             .read_to_vec()
             .map_err(|e| e.to_string())?;
 

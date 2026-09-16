@@ -11,6 +11,7 @@
 //! The DB-matrix conversion lives in `slots` and targets the inspire-gpu
 //! backend's row-major 15-bit slot format.
 
+use crate::manifest::KeyDerivation;
 use rayon::prelude::*;
 use sha3::{
     digest::{ExtendableOutput, Update, XofReader},
@@ -92,6 +93,9 @@ pub struct CuckooParams {
     pub num_hashes: usize,      // 2
     pub max_evictions: usize,   // 10000
     pub seed: [u8; 16],
+    /// What the keys in this table are. Set from the snapshot that filled it,
+    /// and published in the manifest so a client derives keys the same way.
+    pub key_derivation: KeyDerivation,
 }
 
 impl CuckooParams {
@@ -104,6 +108,7 @@ impl CuckooParams {
             num_hashes: 2,
             max_evictions: 10_000,
             seed,
+            key_derivation: KeyDerivation::Address,
         }
     }
 
@@ -510,6 +515,26 @@ impl CuckooTable {
                 continue;
             }
 
+            // Must be read before the header check below, since one of the
+            // spellings contains a column name.
+            if let Some(pos) = trimmed.find("key_derivation=") {
+                let name: String = trimmed[pos + "key_derivation=".len()..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric())
+                    .collect();
+                self.params.key_derivation = match name.as_str() {
+                    "keccak" => KeyDerivation::Keccak,
+                    "address" => KeyDerivation::Address,
+                    other => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("snapshot declares an unknown key_derivation {other:?}"),
+                        ))
+                    }
+                };
+                continue;
+            }
+
             if !header_parsed && (trimmed.contains("balance") || trimmed.contains("address")) {
                 let cols: Vec<&str> = trimmed.split(',').collect();
                 for (i, col) in cols.iter().enumerate() {
@@ -772,5 +797,44 @@ mod tests {
             );
         }
         std::fs::remove_file(&csv_path).ok();
+    }
+
+    /// A snapshot says how its keys were made, so the operator cannot set it
+    /// wrong on the server. Note the "address" spelling contains a column name,
+    /// so it must not be mistaken for the header row.
+    #[test]
+    fn build_from_csv_reads_the_declared_key_derivation() {
+        use std::io::Write;
+        for (declared, want) in [("keccak", KeyDerivation::Keccak), ("address", KeyDerivation::Address)] {
+            let path = std::env::temp_dir().join(format!("kd_{declared}.csv"));
+            {
+                let mut f = File::create(&path).unwrap();
+                writeln!(f, "# block=42").unwrap();
+                writeln!(f, "# key_derivation={declared}").unwrap();
+                writeln!(f, "address,nonce,balance_wei").unwrap();
+                writeln!(f, "00000000219ab540356cbb839cbe05303d7705fa,7,5").unwrap();
+            }
+            let mut table = CuckooTable::new(CuckooParams::new(128, 20, 40, DETERMINISTIC_SEED));
+            let (block, n) = table.build_from_csv(&path).unwrap();
+            assert_eq!((block, n), (42, 1), "{declared}");
+            assert_eq!(table.params.key_derivation, want, "{declared}");
+        }
+    }
+
+    /// A snapshot that declares nothing is address-keyed, as every one written
+    /// before this existed was.
+    #[test]
+    fn build_from_csv_defaults_to_address_keys() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join("kd_none.csv");
+        {
+            let mut f = File::create(&path).unwrap();
+            writeln!(f, "# block=42").unwrap();
+            writeln!(f, "address,nonce,balance_wei").unwrap();
+            writeln!(f, "00000000219ab540356cbb839cbe05303d7705fa,7,5").unwrap();
+        }
+        let mut table = CuckooTable::new(CuckooParams::new(128, 20, 40, DETERMINISTIC_SEED));
+        table.build_from_csv(&path).unwrap();
+        assert_eq!(table.params.key_derivation, KeyDerivation::Address);
     }
 }

@@ -61,8 +61,8 @@ fn main() {
                 eprintln!("bad address hex: {}", e);
                 std::process::exit(1);
             });
-            if key.len() != client.manifest.cuckoo.key_size {
-                eprintln!("address must be {} bytes", client.manifest.cuckoo.key_size);
+            if key.len() != 20 {
+                eprintln!("an address is 20 bytes, got {}", key.len());
                 std::process::exit(1);
             }
             run_lookup(&mut client, &key);
@@ -75,9 +75,9 @@ fn main() {
     }
 }
 
-fn run_lookup(client: &mut PirClient, key: &[u8]) {
+fn run_lookup(client: &mut PirClient, address: &[u8]) {
     let t0 = Instant::now();
-    match client.lookup(key).unwrap_or_else(die) {
+    match client.lookup_address(address).unwrap_or_else(die) {
         Some(l) => {
             let ms = t0.elapsed().as_secs_f64() * 1e3;
             match parse_account_value(&l.value) {

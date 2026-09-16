@@ -45,8 +45,8 @@ pub fn run(
                             let mut bld = builder.lock().unwrap();
                             for u in &updates {
                                 let value = account_update_to_value(u);
-                                bld.apply_update(&u.address, &value);
-                                state.sidecar.push(&u.address, &value, b);
+                                let key = bld.apply_account(&u.address, &value);
+                                state.sidecar.push(&key, &value, b);
                             }
                             synced_to = b;
                             if !updates.is_empty() {
@@ -174,8 +174,8 @@ pub fn run_simulated(
                 };
                 let addr = address_from_index(idx);
                 let value = sim_value(idx, block);
-                bld.apply_update(&addr, &value);
-                state.sidecar.push(&addr, &value, block);
+                let key = bld.apply_account(&addr, &value);
+                state.sidecar.push(&key, &value, block);
             }
         }
         eprintln!(

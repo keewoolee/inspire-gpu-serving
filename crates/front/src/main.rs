@@ -128,7 +128,7 @@ fn handle(mut req: tiny_http::Request, target: &RwLock<String>) {
                     }
                 }
             }
-            let body = resp.body_mut().read_to_vec().unwrap_or_default();
+            let body = resp.body_mut().with_config().limit(128 * 1024 * 1024).read_to_vec().unwrap_or_default();
             let mut out = Response::from_data(body).with_status_code(status);
             for h in headers {
                 out = out.with_header(h);
