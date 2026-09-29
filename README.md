@@ -40,8 +40,9 @@ client never fetches it again.
 
 Every lookup is then a **single round** with the same shape:
 
-1. **Client → server:** hash the address to its 2 cuckoo candidate
-   buckets and send ONE request carrying 2 self-contained PIR queries.
+1. **Client → server:** derive the key from the address (the manifest
+   says how), hash it to its 2 cuckoo candidate buckets, and send ONE
+   request carrying 2 self-contained PIR queries.
    - **Always both, never an early exit** — PIR hides query contents, not
      query counts, so the request shape must not depend on the key.
    - The CRS is fixed, so the queries are valid against every database
@@ -70,7 +71,7 @@ Per lookup, at the 16 GB tier on an RTX 5090:
 |---|---|
 | Up | 2 × 371 KB — the 53-bit CRT-packed queries (actual wire bytes, not estimates) |
 | Down | 2 × 12 KB modulus-switched responses, plus the sidecar suffix (grows ~50 KB per mainnet block; the flip cadence caps it) |
-| Server throughput | up to ~57 lookups/s per card (half the engine's ~115 queries/s at full batch) |
+| Server throughput | up to ~57 lookups/s per card: the engine bound, half its ~115 queries/s at full batch (the HTTP server measures lower, see Validated) |
 | End to end, remote | ~250 ms from a laptop over the internet, ~60 ms of it client-side query building |
 
 ### Design choice: why capacity-2 buckets
@@ -93,20 +94,27 @@ engine's 15-bit plaintext slots:
 
 ```
 bucket (120 B)
-├─ cell 0 (60 B):  address (20 B) ‖ value (40 B)
-└─ cell 1 (60 B):  address (20 B) ‖ value (40 B)
+├─ cell 0 (60 B):  key (20 B) ‖ value (40 B)
+└─ cell 1 (60 B):  key (20 B) ‖ value (40 B)
+key    (20 B)  =   address, or keccak256(address) cut to 20 B
 value  (40 B)  =   reserved (16 B) ‖ balance, BE (16 B) ‖ nonce, BE (8 B)
 ```
 
 - **Cells carry their key** because a retrieved bucket can hold two
   different accounts (or fewer — empty cells are all-zero): the client
-  compares its 20-byte address against both cells, and finding it in
+  compares its 20-byte key against both cells, and finding it in
   neither — nor in the sidecar or stash — is the non-membership proof.
-- **The stored key can be a hash of the address**, freeing cell bytes for
-  the value (relevant for sources with longer keys). It must stay
-  collision-free across the *entire* key set, not just within a bucket
-  (the table treats equal stored keys as the same entry): by the birthday
-  bound, about 12 bytes for 2^28 keys.
+- **The key is the address or its hash**, and the manifest's
+  `key_derivation` field says which, so a client never has to be told. A
+  snapshot read out of a node's state trie arrives keyed by
+  keccak256(address), because the trie is keyed that way and a hash cannot
+  be turned back into an address. The client hashes the address it is
+  asking about, and cutting the hash to 20 bytes keeps the cell layout
+  unchanged.
+- **A stored key must stay collision-free** across the *entire* key set,
+  not just within a bucket (the table treats equal stored keys as the same
+  entry). By the birthday bound about 12 bytes suffice for 2^28 keys, so a
+  shorter hash could free cell bytes for longer values.
 
 [^1]: Asra Ali, Tancrède Lepoint, Sarvar Patel, Mariana Raykova, Phillipp
     Schoppmann, Karn Seth, and Kevin Yeo.
@@ -123,13 +131,28 @@ value  (40 B)  =   reserved (16 B) ‖ balance, BE (16 B) ‖ nonce, BE (8 B)
     ≈0.897 for 2 choices × capacity 2 (Cain–Sanders–Wormald; Fernholz–
     Ramachandran, both SODA 2007), ≈0.918 for 3 choices × capacity 1.
 
-## Validated (2x RTX 5090 pod)
+## Validated
 
 What has actually been demonstrated, beyond the numbers above:
 
-- **All of mainnet fits one card.** ~182M synthetic accounts (mainnet's
-  size as of an early-2026 snapshot) insert into a 16 GB PIR matrix (68%
-  cell load, zero overflow) and serve from 25.9 GB of VRAM.
+- **Mainnet, live, on one H100 (80 GB).** The server serves the 206.8M
+  mainnet accounts holding ETH (out of 418.8M in a full-state dump taken
+  on 2026-09-16) from a 16 GB PIR matrix at 77% cell load, and follows the
+  chain block by block through state diffs. It holds 25.4 GiB of VRAM in
+  steady state and peaks at 53.6 GiB during a generation flip, which
+  builds the next generation beside the serving one (2.11×). The HTTP
+  server sustains ~44 lookups/s with 32 concurrent clients (~10 for a
+  single client), and a lookup moves ~742 KB up and ~277 KB down, most of
+  the download being the sidecar.
+- **Every account needs the next tier.** All 418.8M accounts need 2^28
+  buckets: extrapolating from the measured tier, ~50 GiB in steady state
+  and ~107 GiB during a flip, beyond one H100. On a 32 GB card even the
+  16 GB tier cannot flip in place, so zero-downtime updates there need the
+  two-card role swap below.
+- **The 16 GB tier on a 32 GB card (2x RTX 5090 pod).** ~182M synthetic
+  accounts, about the number of mainnet accounts holding ETH in early
+  2026, insert into a 16 GB PIR matrix (68% cell load, zero overflow) and
+  serve from 25.9 GB of VRAM.
 - **Zero-downtime machine swap** (`scripts/roleswap-demo.sh`). The front
   switched from one GPU's server to the other's mid-load: continuous
   lookups saw **0 failures**, and the response stamp was identical before
@@ -206,7 +229,7 @@ the next flip.
 | [`crates/server`](crates/server) | The serving front: batch scheduler owning the GPU handle, generation builder + flips, sidecar store, chain source (`--eth-rpc` follower or `--simulate` simulator), HTTP API (`/manifest`, `/lookup`, `/sidecar`, `/query`, `/healthz` — wire contract documented in [`src/http.rs`](crates/server/src/http.rs)). |
 | [`crates/client`](crates/client) | Client library + CLI, the reference for wallet integration: single-round fixed-shape lookups, local answer picking, reconfiguration detection. No GPU. |
 | [`crates/front`](crates/front) | Thin switchable forwarder for the cross-machine role swap (`POST /admin/target`; no auth — keep it inside the deployment boundary). |
-| [`crates/chain`](crates/chain) | Ethereum JSON-RPC adapter: block tracking, touched-address extraction, batched balance/nonce fetch, snapshot resync. |
+| [`crates/chain`](crates/chain) | Ethereum JSON-RPC adapter: block tracking, state-diff and touched-address extraction, batched balance/nonce fetch, snapshot resync. Also `ethrex-statedump` (feature `ethrex-dump`), which writes an ethrex node's account table as a snapshot CSV. |
 
 ## Build & run
 
@@ -219,7 +242,9 @@ git clone --recursive https://github.com/keewoolee/inspire-gpu-serving
 cargo build && cargo test
 
 # On a CUDA machine (nvcc under /usr/local/cuda* is found automatically;
-# the CMake build of the engine runs inside cargo on first build):
+# the CMake build of the engine runs inside cargo on first build). The
+# engine builds for sm_120 (RTX 5090) unless INSPIRE_CUDA_ARCH says
+# otherwise, e.g. INSPIRE_CUDA_ARCH=90 for an H100:
 cargo test -p pir-server            # HTTP e2e incl. sidecar, stash, flip
 
 # Serve 1M synthetic accounts and look one up privately:
@@ -242,25 +267,39 @@ scripts/roleswap-demo.sh
 Everything above runs on synthetic data. Pointing the same server at
 mainnet needs two things from the operator:
 
-1. **A snapshot CSV** — one row per account, `address,nonce,balance_wei`,
-   plus a `# block=N` header line recording the block it represents. This
-   is the one input the repo does not produce: export it from a node you
-   control or from an existing dataset (any dump that yields
-   address/nonce/balance works).
+1. **A snapshot CSV**: one row per account, `address,nonce,balance_wei`,
+   plus a `# block=N` header line recording the block it represents.
+   `ethrex-statedump` produces it from an ethrex node, reading the node's
+   flat account table through a RocksDB secondary instance while the node
+   keeps running (all of mainnet in a few minutes). Its first column holds
+   keccak256(address) cut to 20 bytes rather than the address, since the
+   trie stores accounts by that hash, and the file says so with a
+   `# key_derivation=keccak` line that the server carries into the
+   manifest. Any other export that yields address/nonce/balance works
+   too.
 
-2. **A JSON-RPC endpoint** for staying current. Only standard methods
-   against `latest` are used (`eth_getBlockByNumber`, `eth_getBalance`,
-   `eth_getTransactionCount`) — no archive node, no trace APIs — and the
-   calls are paced and retried with backoff to live within hosted-endpoint
-   rate limits. Known limit of this feed: it sees an account only when a
-   transaction touches it, so a balance that changes with no transaction
-   of its own (a withdrawal credit, a transfer inside a contract call)
-   stays stale until that address's next touch; exact per-block fidelity
-   would take a local node's state diffs.
+2. **A JSON-RPC endpoint** for staying current. The follower reads each
+   block's state diff through `debug_traceBlockByNumber` with
+   `prestateTracer` in diff mode, which catches every balance change a
+   transaction makes, internal transfers included. That needs the
+   node's `debug` namespace but no archive node. A node traces only its
+   recent blocks (128 on ethrex), so a snapshot older than that replays
+   the older blocks through the fallback. Without the `debug` namespace
+   the follower falls back to standard methods against `latest`
+   (`eth_getBlockByNumber`, `eth_getBalance`, `eth_getTransactionCount`),
+   paced and retried within hosted-endpoint rate limits. That feed sees
+   an account only when a transaction touches it and misses about a
+   quarter of balance changes.
 
 Then:
 
 ```bash
+# Dump an ethrex node's accounts, next to the node (building it needs
+# libclang; --min-balance 1 keeps only accounts holding ETH, about half):
+cargo run --release -p pir-chain --features ethrex-dump \
+    --bin ethrex-statedump -- --datadir /path/to/ethrex/mainnet \
+    --out accounts.csv --min-balance 1
+
 # If the snapshot lags the chain head, catch it up first (repeats until
 # it converges to within the endpoint's rate limit of the head):
 cargo run --release -p pir-chain --bin resync -- \
