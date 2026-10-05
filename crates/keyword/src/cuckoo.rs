@@ -210,6 +210,7 @@ impl CuckooHash {
 // Cuckoo table
 // ============================================================================
 
+#[derive(Clone)]
 pub struct CuckooTable {
     pub params: CuckooParams,
     pub hasher: CuckooHash,
@@ -708,6 +709,42 @@ impl CuckooTable {
         Ok((block_number, slots))
     }
 
+    /// Write a storage table back out in the form `build_from_storage_csv`
+    /// reads, stamped at `block`, so a server can save its own state and start
+    /// from it again. The canary is left out, being the server's own entry,
+    /// and so are slots that went to zero, which a fresh dump would not have
+    /// either. Returns the number of slots written.
+    pub fn write_storage_csv(&self, path: &Path, block: u64) -> io::Result<usize> {
+        use std::io::Write;
+        let (ks, cs) = (self.params.key_size, self.params.cell_size());
+        let mut out = std::io::BufWriter::with_capacity(16 << 20, File::create(path)?);
+        let contracts: Vec<String> =
+            self.params.contracts.iter().map(|c| format!("0x{}", hex::encode(c))).collect();
+        writeln!(out, "# block={block}")?;
+        writeln!(out, "# key_derivation=storage")?;
+        writeln!(out, "# contracts={}", contracts.join(","))?;
+        writeln!(out, "key,value")?;
+
+        let cells = (0..self.params.num_buckets)
+            .flat_map(|b| (0..self.used[b] as usize).map(move |c| (b, c)))
+            .map(|(b, c)| self.cell_slice(b, c))
+            .chain(self.stash.iter().map(|cell| &cell[..cs]));
+        let mut written = 0;
+        for cell in cells {
+            let (key, value) = cell.split_at(ks);
+            let start = value.iter().position(|&b| b != 0);
+            match start {
+                Some(start) if key != &CANARY_ADDRESS[..] => {
+                    writeln!(out, "{},{}", hex::encode(key), hex::encode(&value[start..]))?;
+                    written += 1;
+                }
+                _ => {}
+            }
+        }
+        out.flush()?;
+        Ok(written)
+    }
+
     /// Export all occupied cells to CSV format: `address,nonce,balance_wei`.
     /// First line is `# block=BLOCK_NUMBER`, second line is the header.
     pub fn export_csv(&self, path: &Path, block_number: u64) -> io::Result<usize> {
@@ -997,5 +1034,39 @@ mod tests {
             let mut table = CuckooTable::new(CuckooParams::new(128, 20, 40, DETERMINISTIC_SEED));
             assert!(table.build_from_storage_csv(&path).is_err(), "{name}");
         }
+    }
+
+    /// What a server saves of its storage table loads back as the same table,
+    /// without the canary or the slots that went to zero.
+    #[test]
+    fn a_saved_storage_table_loads_back() {
+        let path = write_storage_csv(
+            "storage_save_in.csv",
+            &[
+                "# block=7",
+                "# contracts=0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+                "key,value",
+                "d6a3e40d689f6d6eec2db745e1a538aac45c7e87,4438f6820aa3",
+                "00000000219ab540356cbb839cbe05303d7705fa,80000000000000000000000000000000000000000000000000000000000000ff",
+                "1111111111111111111111111111111111111111,05",
+            ],
+        );
+        let mut table = CuckooTable::new(CuckooParams::new(128, 20, 40, DETERMINISTIC_SEED));
+        table.build_from_storage_csv(&path).unwrap();
+        let emptied = hex::decode("1111111111111111111111111111111111111111").unwrap();
+        table.upsert(&emptied, &[0u8; 40]);
+        table.upsert(&CANARY_ADDRESS, &canary_value(9));
+
+        let saved = std::env::temp_dir().join("storage_save_out.csv");
+        assert_eq!(table.write_storage_csv(&saved, 9).unwrap(), 2);
+        let mut back = CuckooTable::new(CuckooParams::new(128, 20, 40, DETERMINISTIC_SEED));
+        assert_eq!(back.build_from_storage_csv(&saved).unwrap(), (9, 2));
+        assert_eq!(back.params.contracts, table.params.contracts);
+        for key in ["d6a3e40d689f6d6eec2db745e1a538aac45c7e87", "00000000219ab540356cbb839cbe05303d7705fa"] {
+            let key = hex::decode(key).unwrap();
+            assert_eq!(back.lookup(&key), table.lookup(&key));
+        }
+        assert_eq!(back.lookup(&emptied), None);
+        assert_eq!(back.lookup(&CANARY_ADDRESS), None);
     }
 }

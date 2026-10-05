@@ -6,8 +6,15 @@ use crate::generation::{GenerationBuilder, ServingState};
 use pir_chain::rpc::{account_update_to_value, EthRpc};
 use pir_keyword::cuckoo::address_from_index;
 use pir_keyword::storage::storage_value;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+/// How many recent blocks a node can trace (128 on ethrex). A storage table
+/// has no other source of changes, so once the next block it needs is older
+/// than this, it can never catch up again and needs a fresh dump.
+pub const TRACE_WINDOW: u64 = 128;
 
 pub struct FollowerConfig {
     /// Rebuild + flip the generation this often.
@@ -16,6 +23,36 @@ pub struct FollowerConfig {
     pub poll_every: Duration,
     /// What the served table holds, and so what to take from each block.
     pub feed: Feed,
+    /// Save a storage table this often, so a restart can start from it.
+    pub checkpoint: Option<Checkpoint>,
+}
+
+/// Where and how often a storage table saves itself. The file is the one the
+/// server starts from, replaced whole so a crash mid-write leaves the last
+/// complete save. A restart within the trace window of the last save picks up
+/// where it left off; a longer outage needs a fresh dump.
+pub struct Checkpoint {
+    pub path: PathBuf,
+    pub every: Duration,
+}
+
+/// Save a copy of the table as of `block` over the snapshot file.
+fn save_checkpoint(table: &pir_keyword::cuckoo::CuckooTable, path: &PathBuf, block: u64) {
+    let t0 = Instant::now();
+    let partial = PathBuf::from(format!("{}.partial", path.display()));
+    let saved = table
+        .write_storage_csv(&partial, block)
+        .and_then(|n| std::fs::rename(&partial, path).map(|_| n));
+    match saved {
+        Ok(n) => eprintln!(
+            "checkpoint: {} slots at block #{} saved to {} in {:.1}s",
+            n,
+            block,
+            path.display(),
+            t0.elapsed().as_secs_f64()
+        ),
+        Err(e) => eprintln!("checkpoint at block #{} failed: {}", block, e),
+    }
 }
 
 /// What a table follows the chain for.
@@ -79,6 +116,8 @@ pub fn run(
     // every poll tick keeps it rate-limited.
     let mut fail_streak: u32 = 0;
     let backoff = |streak: u32| Duration::from_secs((1u64 << streak.min(6)).min(60));
+    let mut last_checkpoint = Instant::now();
+    let mut checkpoint_writer: Option<JoinHandle<()>> = None;
 
     loop {
         // 1. Pull new blocks into the sidecar + host truth.
@@ -103,6 +142,20 @@ pub fn run(
                             }
                         }
                         Err(e) => {
+                            // Accounts fall back to weaker sources inside the
+                            // fetch. Storage cannot, so once the block is out
+                            // of reach, serving on would only serve stale
+                            // values. Stopping makes the outage visible.
+                            if matches!(cfg.feed, Feed::Storage(_))
+                                && head.saturating_sub(b) >= TRACE_WINDOW
+                            {
+                                eprintln!(
+                                    "block #{} can no longer be traced ({}). Stopping, since this \
+                                     table cannot catch up without a fresh dump",
+                                    b, e
+                                );
+                                std::process::exit(1);
+                            }
                             fail_streak += 1;
                             let wait = backoff(fail_streak);
                             eprintln!(
@@ -146,6 +199,21 @@ pub fn run(
                         synced_to,
                         state.sidecar.len()
                     );
+
+                    // Save from a copy, so following goes on while it writes.
+                    // The copy is taken here, where the truth is exactly the
+                    // state at `synced_to`.
+                    let writer_idle = checkpoint_writer.as_ref().map_or(true, |w| w.is_finished());
+                    if let Some(cp) = &cfg.checkpoint {
+                        if last_checkpoint.elapsed() >= cp.every && writer_idle {
+                            let table = builder.lock().unwrap().table.clone();
+                            let (path, block) = (cp.path.clone(), synced_to);
+                            checkpoint_writer = Some(std::thread::spawn(move || {
+                                save_checkpoint(&table, &path, block)
+                            }));
+                            last_checkpoint = Instant::now();
+                        }
+                    }
                 }
                 Err(e) => {
                     // Back off a full rebuild interval; retrying every poll

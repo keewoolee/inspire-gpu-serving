@@ -6,11 +6,12 @@
 
 use clap::Parser;
 use pir_keyword::cuckoo::{CuckooParams, CuckooTable, DETERMINISTIC_SEED};
-use pir_server::follower::{self, Feed, FollowerConfig, SimulatorConfig};
+use pir_server::follower::{self, Checkpoint, Feed, FollowerConfig, SimulatorConfig, TRACE_WINDOW};
 use pir_server::generation::{GenerationBuilder, ServingState};
 use pir_server::http::serve;
 use pir_server::sidecar::Sidecar;
-use std::path::Path;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -26,6 +27,13 @@ struct Args {
     /// The follower then tracks those contracts' storage, not accounts.
     #[clap(long, conflicts_with_all = ["accounts_csv", "synthetic", "simulate"])]
     storage_csv: Option<String>,
+
+    /// With --storage-csv: every this many seconds, save the table over that
+    /// file, so a restart starts from recent state. A storage table cannot
+    /// catch up from further back than the node traces, so without this a
+    /// restart needs a fresh dump.
+    #[clap(long, requires = "storage_csv")]
+    checkpoint_secs: Option<u64>,
 
     /// Serve N synthetic accounts instead of a snapshot.
     #[clap(long)]
@@ -108,6 +116,9 @@ fn main() {
             snapshot_block = block;
         }
         (None, Some(csv), _) => {
+            if let Some(url) = &args.eth_rpc {
+                refuse_unreachable_snapshot(Path::new(csv), url);
+            }
             let (block, n) = table
                 .build_from_storage_csv(Path::new(csv))
                 .expect("failed to load storage CSV");
@@ -193,6 +204,10 @@ fn main() {
             rebuild_every: Duration::from_secs(args.rebuild_secs),
             poll_every: Duration::from_secs(3),
             feed,
+            checkpoint: args.checkpoint_secs.map(|secs| Checkpoint {
+                path: PathBuf::from(args.storage_csv.as_ref().unwrap()),
+                every: Duration::from_secs(secs),
+            }),
         };
         std::thread::spawn(move || follower::run(rpc, builder, state2, snapshot_block, cfg));
         eprintln!(
@@ -210,4 +225,39 @@ fn main() {
         t0.elapsed().as_secs_f64()
     );
     serve(http, state, args.http_workers);
+}
+
+/// Refuse a storage snapshot the follower could never bring current, because
+/// the first block it needs is already older than the node can trace. Checked
+/// before loading, so a restart after a long outage fails at once and says a
+/// fresh dump is needed, rather than loading gigabytes and then serving stale
+/// values.
+fn refuse_unreachable_snapshot(csv: &Path, url: &str) {
+    let stamp = std::fs::File::open(csv).ok().and_then(|f| {
+        BufReader::new(f)
+            .lines()
+            .take(8)
+            .map_while(Result::ok)
+            .find_map(|line| line.trim().strip_prefix("# block=")?.trim().parse::<u64>().ok())
+    });
+    // A file without a stamp is the loader's to reject, with its own message.
+    let Some(block) = stamp else { return };
+    match pir_chain::rpc::EthRpc::new(url).block_number() {
+        Ok(head) if head.saturating_sub(block + 1) >= TRACE_WINDOW => {
+            eprintln!(
+                "error: {} is stamped at block #{}, {} blocks behind the head, and the node \
+                 traces only its last {}. The table could never catch up. Take a fresh dump.",
+                csv.display(),
+                block,
+                head - block,
+                TRACE_WINDOW
+            );
+            std::process::exit(1);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("error: cannot reach {} to check the snapshot's age: {}", url, e);
+            std::process::exit(1);
+        }
+    }
 }
