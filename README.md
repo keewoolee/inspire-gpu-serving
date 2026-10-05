@@ -16,7 +16,8 @@ no downtime.
     that arrived since, so serving stays current between the periodic
     re-preprocesses.
 - **Deployment target.** Private Ethereum state retrieval (a wallet
-  privately reading an account's balance and nonce); the Ethereum side
+  privately reading an account's balance and nonce, or its balance of a
+  token); the Ethereum side
   is confined to `crates/chain` (a JSON-RPC chain follower) plus a chain
   simulator for demos. Any other key-value source slots in by supplying the same two
   things: an initial key-value set, and a stream of updates.
@@ -161,6 +162,13 @@ What has actually been demonstrated, beyond the numbers above:
   (`scripts/live-sim-demo.sh`). Over an accelerated simulation the
   serving snapshot advanced 0 → 9 → 18 with **no client resync**, and an
   account updated every block was always current.
+- **ERC-20 balances, live beside the accounts on the same H100.** The
+  storage of USDC, USDT, DAI and WETH is 53.7M slots, which fill a
+  2^25-bucket table to 80% and take 6.5 GB of VRAM next to the account
+  table. For 40 holders and all four tokens, each of the 160 balances
+  matched `balanceOf` on the node at the block that answered it. A restart
+  from the server's own save resumed at the next block, and 96 more
+  balances checked after it all matched.
 - **The live-chain path works end to end.** Against a key-less public
   endpoint, the server snapshotted the mainnet head, ingested live
   blocks, flipped, and returned the fresh balance/nonce of an account
@@ -224,12 +232,12 @@ the next flip.
 
 | Crate | Contents |
 |---|---|
-| [`crates/keyword`](crates/keyword) | Cuckoo hashing with capacity-2 buckets; 15-bit byte↔slot packing; the row-major slot matrix the engine ingests; the manifest and sidecar-broadcast wire types. |
+| [`crates/keyword`](crates/keyword) | Cuckoo hashing with capacity-2 buckets; 15-bit byte↔slot packing; the row-major slot matrix the engine ingests; the manifest and sidecar-broadcast wire types; keys and values for contract storage slots. |
 | [`crates/backend-ffi`](crates/backend-ffi) | Safe Rust bindings over the `ipir_*` C ABI. The client half builds anywhere (compiles the engine's CPU sources directly — no CMake, no CUDA); the server half (`gpu` feature) links the static libraries, running the CMake build itself when needed. |
 | [`crates/server`](crates/server) | The serving front: batch scheduler owning the GPU handle, generation builder + flips, sidecar store, chain source (`--eth-rpc` follower or `--simulate` simulator), HTTP API (`/manifest`, `/lookup`, `/sidecar`, `/query`, `/healthz` — wire contract documented in [`src/http.rs`](crates/server/src/http.rs)). |
-| [`crates/client`](crates/client) | Client library + CLI, the reference for wallet integration: single-round fixed-shape lookups, local answer picking, reconfiguration detection. No GPU. |
+| [`crates/client`](crates/client) | Client library + CLI, the reference for wallet integration: single-round fixed-shape lookups of accounts and token balances, local answer picking, reconfiguration detection. No GPU. |
 | [`crates/front`](crates/front) | Thin switchable forwarder for the cross-machine role swap (`POST /admin/target`; no auth — keep it inside the deployment boundary). |
-| [`crates/chain`](crates/chain) | Ethereum JSON-RPC adapter: block tracking, state-diff and touched-address extraction, batched balance/nonce fetch, snapshot resync. Also `ethrex-statedump` (feature `ethrex-dump`), which writes an ethrex node's account table as a snapshot CSV. |
+| [`crates/chain`](crates/chain) | Ethereum JSON-RPC adapter: block tracking, state-diff and touched-address extraction, batched balance/nonce fetch, snapshot resync. Also `ethrex-statedump` (feature `ethrex-dump`), which writes an ethrex node's account table, or the storage of chosen contracts, as a snapshot CSV stamped at the chain head. |
 
 ## Build & run
 
@@ -271,7 +279,10 @@ mainnet needs two things from the operator:
    plus a `# block=N` header line recording the block it represents.
    `ethrex-statedump` produces it from an ethrex node, reading the node's
    flat account table through a RocksDB secondary instance while the node
-   keeps running (all of mainnet in a few minutes). Its first column holds
+   keeps running (all of mainnet in a few minutes). That table trails the
+   node's head by 128 blocks, so the dump first replays those blocks
+   through the node's state diffs and stamps the file at the head. Its
+   first column holds
    keccak256(address) cut to 20 bytes rather than the address, since the
    trie stores accounts by that hash, and the file says so with a
    `# key_derivation=keccak` line that the server carries into the
@@ -283,8 +294,9 @@ mainnet needs two things from the operator:
    `prestateTracer` in diff mode, which catches every balance change a
    transaction makes, internal transfers included. That needs the
    node's `debug` namespace but no archive node. A node traces only its
-   recent blocks (128 on ethrex), so a snapshot older than that replays
-   the older blocks through the fallback. Without the `debug` namespace
+   recent blocks (128 on ethrex, about 25 minutes), so a server started
+   from a snapshot older than that fills in the older blocks through the
+   fallback below. Without the `debug` namespace
    the follower falls back to standard methods against `latest`
    (`eth_getBlockByNumber`, `eth_getBalance`, `eth_getTransactionCount`),
    paced and retried within hosted-endpoint rate limits. That feed sees
@@ -316,3 +328,92 @@ cargo run --release -p pir-client -- --server http://HOST:8080 \
     lookup 0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045
 ```
 
+## Token balances
+
+The server can also serve ERC-20 balances, from a table that holds every
+storage slot of chosen contracts. A token's `balanceOf(holder)` is one slot of
+its balances mapping, so a wallet reads it like any other key. Such a table
+runs in a server process of its own, started with `--storage-csv` instead of
+`--accounts-csv`, and its manifest says `"key_derivation": "storage"` and
+lists the contracts it holds.
+
+A node's storage table keys each slot by keccak256 of the contract and of the
+slot, and neither hash can be turned back, so the PIR table is keyed the same
+way:
+
+```
+slot   (32 B)  =   keccak256(pad32(holder) ‖ pad32(p))      p: slot of the balances mapping
+key    (20 B)  =   keccak256(keccak256(contract) ‖ keccak256(slot)) cut to 20 B
+value  (40 B)  =   zero (8 B) ‖ the slot's value, BE (32 B)
+```
+
+The client knows four tokens, the ones kohaku-cli syncs by default. Each `p`
+was checked against `balanceOf` on mainnet.
+
+| Token | Contract | `p` | Decimals |
+|---|---|---|---|
+| USDC | `0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48` | 9 | 6 |
+| USDT | `0xdAC17F958D2ee523a2206206994597C13D831ec7` | 2 | 6 |
+| DAI | `0x6B175474E89094C44Da98b954EedeAC495271d0F` | 2 | 18 |
+| WETH | `0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2` | 3 | 18 |
+
+- **USDC keeps a blacklist flag** in the top bit of a balance slot. The
+  client clears it, as `balanceOf` does.
+- **No match is a zero balance.** Storage holds no empty slots, so finding
+  the key in neither bucket, nor in the sidecar or stash, means the slot is 0.
+- **Always look up every token** for every address a wallet syncs, even one
+  it expects to be empty. The server sees how many lookups arrive, so asking
+  only for the tokens an address holds would tell it which ones those are.
+- **Any slot of these contracts can be read**, not just balances, since the
+  table holds their whole storage, allowances included. A slot of any other
+  contract is not in the table, so the client refuses it rather than reading
+  it as empty.
+- **Each token costs one lookup**, the same as an account. Grouping a
+  holder's balances under one key would need the holders' addresses, and the
+  node's state has only the slot hashes.
+
+From code, or from the command line:
+
+```rust
+let mut client = PirClient::connect("http://HOST:8081")?;
+for token in pir_client::TOKENS {                    // USDC, USDT, DAI, WETH
+    let b = client.token_balance(&token, &holder)?;  // b.balance: 32 B, BE
+}
+```
+
+```bash
+cargo run --release -p pir-client -- --server http://HOST:8081 \
+    tokens 0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045
+```
+
+`lookup_storage(contract, slot)` reads any other slot of the four contracts.
+
+Serving it:
+
+```bash
+# Dump the contracts' storage next to the node. The node's table trails the
+# head by 128 blocks, so the dump replays them and stamps the file at the head:
+cargo run --release -p pir-chain --features ethrex-dump \
+    --bin ethrex-statedump -- --datadir /path/to/ethrex/mainnet \
+    --out tokens.csv \
+    --storage-of 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 \
+    --storage-of 0xdAC17F958D2ee523a2206206994597C13D831ec7 \
+    --storage-of 0x6B175474E89094C44Da98b954EedeAC495271d0F \
+    --storage-of 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2
+
+# Serve it next to the account server, saving the table over the same file
+# every 10 minutes:
+cargo run --release -p pir-server -- --storage-csv tokens.csv \
+    --buckets 33554432 --eth-rpc http://NODE:8545 \
+    --checkpoint-secs 600 --listen 0.0.0.0:8081
+```
+
+A storage table can catch up only through the node's state diffs, because a
+transaction's from and to do not say which slots it changed. So the server
+refuses a snapshot it could not catch up from, the follower stops the server
+once a block it needs has left the node's window, and `--checkpoint-secs`
+keeps a recent save to restart from. A longer outage needs a fresh dump.
+
+The storage table can share the account table's `--crs-seed`, since the CRS
+is public. Its response stamp also covers the contracts it holds, so a client
+sent to the wrong table still notices.
