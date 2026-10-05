@@ -69,6 +69,9 @@ const MAX_RESPONSE_BYTES: u64 = 128 * 1024 * 1024;
 
 pub struct PirClient {
     base: String,
+    /// One agent for all lookups, so they share a kept-alive connection
+    /// instead of paying a new TCP handshake and slow start each time.
+    agent: ureq::Agent,
     pub manifest: Manifest,
     params: Params,
     hasher: CuckooHash,
@@ -84,6 +87,7 @@ impl PirClient {
         let (manifest, params, hasher) = Self::fetch_manifest(&base)?;
         Ok(PirClient {
             base,
+            agent: ureq::Agent::new_with_defaults(),
             manifest,
             params,
             hasher,
@@ -171,7 +175,7 @@ impl PirClient {
         let mut body = pack_query(&self.params, &q0.flat)?;
         body.extend_from_slice(&pack_query(&self.params, &q1.flat)?);
 
-        let mut resp = ureq::post(&format!("{}/lookup", self.base))
+        let mut resp = self.agent.post(&format!("{}/lookup", self.base))
             .send(&body[..])
             .map_err(|e| format!("lookup failed: {}", e))?;
         let stamp = resp
