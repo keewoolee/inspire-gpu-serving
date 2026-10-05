@@ -14,10 +14,13 @@
 //! the hash are written as the key, which keeps the entry the same size as an
 //! address-keyed one.
 //!
-//! A scan takes long enough that blocks arrive during it, so the snapshot is
-//! not one clean block boundary. The header records a block below whatever the
-//! data reflects, and the follower replays from there: applying diffs in order
-//! leaves every account at its head state, so an early start is always safe.
+//! The table trails the node's head by `--margin` blocks, which is also as far
+//! back as the node can trace. So before it reads the table, a dump replays
+//! those blocks through the node's state diffs and folds them in, and stamps the
+//! file at the head it reached. Blocks that arrive while the table is read are
+//! left to the follower, from that stamp: applying diffs in order leaves every
+//! account at its head state, so starting from a block the data already
+//! reflects is safe.
 //!
 //! Contract storage sits in a second table, `storage_flatkeyvalue`, keyed by
 //! the contract's address hash followed by each slot's hash. `--storage-of`
@@ -68,14 +71,11 @@ struct Args {
     #[clap(long, default_value = "http://127.0.0.1:8545")]
     eth_rpc: String,
 
-    /// How far below the chain head to stamp the snapshot. The table trails the
-    /// node, because state settles into it a layer at a time rather than a block
-    /// at a time, and sampling accounts that had just changed put that lag at
-    /// exactly 128 blocks. A larger margin is not safer: a node keeps 128 blocks
-    /// of state history, so it cannot trace further back than that either, and
-    /// a stamp below the window leaves the follower with blocks it can never
-    /// replay. The two numbers are the same depth, so 128 is both the floor and
-    /// the ceiling.
+    /// How far the table trails the chain head. State settles into it a layer
+    /// at a time rather than a block at a time, and sampling accounts that had
+    /// just changed put that lag at exactly 128 blocks, which is also as far
+    /// back as the node can trace. A dump replays these blocks from the node
+    /// before reading the table, so the file it writes is stamped at the head.
     #[clap(long, default_value_t = 128)]
     margin: u64,
 
@@ -125,6 +125,10 @@ fn main() {
         dump_storage(&args);
         return;
     }
+    if args.probe.is_empty() && args.count_storage.is_empty() && args.probe_mapping.is_empty() {
+        dump_accounts(&args);
+        return;
+    }
 
     let head = match chain_head(&args.eth_rpc) {
         Ok(head) => head,
@@ -134,7 +138,7 @@ fn main() {
         }
     };
     let stamp = head.saturating_sub(args.margin);
-    println!("chain head {head}, stamping the snapshot at block {stamp}");
+    println!("chain head {head}, and the table reflects block {stamp}");
 
     let db = match open_secondary(&args.datadir, &args.secondary) {
         Ok(db) => db,
@@ -173,95 +177,8 @@ fn main() {
         }
     };
 
-    if !args.probe.is_empty() {
-        for address in &args.probe {
-            probe_address(&db, &cf, address);
-        }
-        return;
-    }
-
-    let file = match std::fs::File::create(&args.out) {
-        Ok(file) => file,
-        Err(e) => {
-            eprintln!("could not write {}: {e}", args.out.display());
-            std::process::exit(1);
-        }
-    };
-    let mut out = BufWriter::with_capacity(16 << 20, file);
-    // Every comment goes above the column header, and none of them may contain
-    // a column name: the loader treats the first line mentioning one as the
-    // header row.
-    writeln!(out, "# block={stamp}").unwrap();
-    // The server reads this and publishes it in the manifest, so a client
-    // derives keys the same way without being told.
-    writeln!(out, "# key_derivation=keccak").unwrap();
-    if args.min_balance > 0 {
-        writeln!(out, "# accounts holding under {} wei are left out", args.min_balance).unwrap();
-    }
-    writeln!(out, "address,nonce,balance_wei").unwrap();
-
-    let t0 = Instant::now();
-    let (mut written, mut skipped, mut filtered) = (0u64, 0u64, 0u64);
-
-    for item in db.iterator_cf(&cf, IteratorMode::Start) {
-        let (key, value) = match item {
-            Ok(pair) => pair,
-            Err(e) => {
-                eprintln!("\niteration stopped at {written} accounts: {e}");
-                break;
-            }
-        };
-        let hash = match nibbles_to_hash(&key) {
-            Some(hash) => hash,
-            None => {
-                skipped += 1;
-                continue;
-            }
-        };
-        let (nonce, balance) = match decode_account(&value) {
-            Some(account) => account,
-            None => {
-                skipped += 1;
-                continue;
-            }
-        };
-        if balance < args.min_balance {
-            filtered += 1;
-            continue;
-        }
-        writeln!(out, "{},{},{}", hex::encode(&hash[..20]), nonce, balance).unwrap();
-
-        written += 1;
-        if written % 5_000_000 == 0 {
-            let secs = t0.elapsed().as_secs_f64();
-            println!(
-                "  {written} accounts ({:.0}k/s, {:.1} min elapsed)",
-                written as f64 / secs / 1000.0,
-                secs / 60.0
-            );
-        }
-        if args.limit.is_some_and(|limit| written >= limit) {
-            break;
-        }
-    }
-
-    out.flush().unwrap();
-    let secs = t0.elapsed().as_secs_f64();
-    println!(
-        "wrote {written} accounts to {} in {:.1} min",
-        args.out.display(),
-        secs / 60.0
-    );
-    if filtered > 0 {
-        let seen = written + filtered;
-        println!(
-            "  {filtered} of {seen} held less than {} wei and were left out ({:.1}%)",
-            args.min_balance,
-            100.0 * filtered as f64 / seen as f64
-        );
-    }
-    if skipped > 0 {
-        println!("  {skipped} entries could not be read");
+    for address in &args.probe {
+        probe_address(&db, &cf, address);
     }
 }
 
@@ -317,6 +234,145 @@ fn probe_address<C: rocksdb::AsColumnFamilyRef>(db: &DB, cf: &C, address: &str) 
     println!("  not present under either key shape");
 }
 
+/// Account values the replay has seen, by address hash: (nonce, balance).
+type ReplayedAccounts = HashMap<[u8; 32], (u64, u128)>;
+
+/// Write every account as a snapshot CSV, stamped at the chain head, for the
+/// reason `dump_storage` gives. Accounts do have a fallback for blocks the node
+/// can no longer trace, but it misses accounts changed inside contract calls,
+/// so a dump stamped at the table's lag would leave those stale.
+fn dump_accounts(args: &Args) {
+    let rpc = EthRpc::new(&args.eth_rpc);
+    let head = rpc
+        .block_number()
+        .unwrap_or_else(|e| fail("could not read the chain head", e));
+    let mut next = head.saturating_sub(args.margin) + 1;
+    let mut replayed = ReplayedAccounts::new();
+    let t0 = Instant::now();
+    replay_accounts(&rpc, &mut next, &mut replayed)
+        .unwrap_or_else(|e| fail("replay failed (rerun if the oldest block left the window)", e));
+
+    let db = open_secondary(&args.datadir, &args.secondary)
+        .unwrap_or_else(|e| fail("could not open the database as a secondary", e));
+    if let Err(e) = db.try_catch_up_with_primary() {
+        eprintln!("warning: could not catch up with the primary: {e}");
+    }
+    let cf = db
+        .cf_handle(ACCOUNT_FLATKEYVALUE)
+        .unwrap_or_else(|| fail("no account table", ACCOUNT_FLATKEYVALUE));
+    replay_accounts(&rpc, &mut next, &mut replayed).unwrap_or_else(|e| fail("replay failed", e));
+    let stamp = next - 1;
+    println!(
+        "replayed to block {stamp} in {:.1} s ({} accounts touched)",
+        t0.elapsed().as_secs_f64(),
+        replayed.len()
+    );
+
+    let file = std::fs::File::create(&args.out)
+        .unwrap_or_else(|e| fail(&format!("could not write {}", args.out.display()), e));
+    let mut out = BufWriter::with_capacity(16 << 20, file);
+    // Every comment goes above the column header, and none of them may contain
+    // a column name: the loader treats the first line mentioning one as the
+    // header row.
+    writeln!(out, "# block={stamp}").unwrap();
+    // The server reads this and publishes it in the manifest, so a client
+    // derives keys the same way without being told.
+    writeln!(out, "# key_derivation=keccak").unwrap();
+    if args.min_balance > 0 {
+        writeln!(out, "# accounts holding under {} wei are left out", args.min_balance).unwrap();
+    }
+    writeln!(out, "address,nonce,balance_wei").unwrap();
+
+    let t1 = Instant::now();
+    let (mut written, mut skipped, mut filtered) = (0u64, 0u64, 0u64);
+    let mut write = |out: &mut BufWriter<std::fs::File>, hash: &[u8; 32], nonce: u64, balance: u128| {
+        if balance < args.min_balance {
+            filtered += 1;
+            return false;
+        }
+        writeln!(out, "{},{},{}", hex::encode(&hash[..20]), nonce, balance).unwrap();
+        true
+    };
+
+    let mut limited = false;
+    for item in db.iterator_cf(&cf, IteratorMode::Start) {
+        let (key, value) = item.unwrap_or_else(|e| fail("iteration stopped", e));
+        let Some(hash) = nibbles_to_hash(&key) else {
+            skipped += 1;
+            continue;
+        };
+        let account = match replayed.remove(&hash) {
+            Some(account) => account,
+            None => match decode_account(&value) {
+                Some(account) => account,
+                None => {
+                    skipped += 1;
+                    continue;
+                }
+            },
+        };
+        if !write(&mut out, &hash, account.0, account.1) {
+            continue;
+        }
+        written += 1;
+        if written % 5_000_000 == 0 {
+            let secs = t1.elapsed().as_secs_f64();
+            println!(
+                "  {written} accounts ({:.0}k/s, {:.1} min elapsed)",
+                written as f64 / secs / 1000.0,
+                secs / 60.0
+            );
+        }
+        if args.limit.is_some_and(|limit| written >= limit) {
+            limited = true;
+            break;
+        }
+    }
+
+    // Accounts the replay created that the table did not have yet. A dump cut
+    // short by --limit is a sample and leaves them out.
+    let mut added = 0u64;
+    if !limited {
+        for (hash, (nonce, balance)) in replayed.drain() {
+            if write(&mut out, &hash, nonce, balance) {
+                added += 1;
+            }
+        }
+    }
+
+    out.flush().unwrap();
+    println!(
+        "wrote {} accounts to {} in {:.1} min ({added} new since the table), stamped at block {stamp}",
+        written + added,
+        args.out.display(),
+        t1.elapsed().as_secs_f64() / 60.0
+    );
+    if filtered > 0 {
+        let seen = written + added + filtered;
+        println!(
+            "  {filtered} of {seen} held less than {} wei and were left out ({:.1}%)",
+            args.min_balance,
+            100.0 * filtered as f64 / seen as f64
+        );
+    }
+    if skipped > 0 {
+        println!("  {skipped} entries could not be read");
+    }
+}
+
+/// Replay blocks into account values, from the same state diffs the follower
+/// reads, and with no fallback: a block it cannot trace stops the dump.
+fn replay_accounts(rpc: &EthRpc, next: &mut u64, replayed: &mut ReplayedAccounts) -> Result<(), String> {
+    replay_to_head(rpc, next, |block| {
+        for update in rpc.fetch_block_updates_via_diff(block)? {
+            let balance = be_u128(minimal(&update.balance))
+                .ok_or_else(|| format!("balance past 128 bits at block {block}"))?;
+            replayed.insert(keccak256(&update.address), (update.nonce, balance));
+        }
+        Ok(())
+    })
+}
+
 /// Slot values the replay has seen, by contract and slot hash: the hash is
 /// what the table is keyed by.
 type Replayed = HashMap<([u8; 20], [u8; 32]), [u8; 32]>;
@@ -353,7 +409,7 @@ fn dump_storage(args: &Args) {
     let mut next = head.saturating_sub(args.margin) + 1;
     let mut replayed = Replayed::new();
     let t0 = Instant::now();
-    replay_to_head(&rpc, &contracts, &mut next, &mut replayed)
+    replay_storage(&rpc, &contracts, &mut next, &mut replayed)
         .unwrap_or_else(|e| fail("replay failed (rerun if the oldest block left the window)", e));
 
     let db = open_secondary(&args.datadir, &args.secondary)
@@ -366,7 +422,7 @@ fn dump_storage(args: &Args) {
         .unwrap_or_else(|| fail("no storage table", STORAGE_FLATKEYVALUE));
     // The head moved while the table opened. Anything after this pass is left
     // to the follower, from the block the file is stamped with.
-    replay_to_head(&rpc, &contracts, &mut next, &mut replayed)
+    replay_storage(&rpc, &contracts, &mut next, &mut replayed)
         .unwrap_or_else(|e| fail("replay failed", e));
     let stamp = next - 1;
     println!(
@@ -454,13 +510,13 @@ fn fail(what: &str, e: impl std::fmt::Display) -> ! {
     std::process::exit(1);
 }
 
-/// Trace every block from `next` to the head, re-reading the head until it
-/// stops moving, and keep the last value each touched slot took.
+/// Run `apply` on every block from `next` to the head, re-reading the head
+/// until it stops moving. Later blocks overwrite earlier ones, so what is kept
+/// is each touched value as of the last block replayed.
 fn replay_to_head(
     rpc: &EthRpc,
-    contracts: &[[u8; 20]],
     next: &mut u64,
-    replayed: &mut Replayed,
+    mut apply: impl FnMut(u64) -> Result<(), String>,
 ) -> Result<(), String> {
     loop {
         let head = rpc.block_number()?;
@@ -468,12 +524,25 @@ fn replay_to_head(
             return Ok(());
         }
         while *next <= head {
-            for update in rpc.fetch_block_storage_updates(*next, contracts)? {
-                replayed.insert((update.contract, keccak256(&update.slot)), update.value);
-            }
+            apply(*next)?;
             *next += 1;
         }
     }
+}
+
+/// Replay blocks into slot values of `contracts`.
+fn replay_storage(
+    rpc: &EthRpc,
+    contracts: &[[u8; 20]],
+    next: &mut u64,
+    replayed: &mut Replayed,
+) -> Result<(), String> {
+    replay_to_head(rpc, next, |block| {
+        for update in rpc.fetch_block_storage_updates(block, contracts)? {
+            replayed.insert((update.contract, keccak256(&update.slot)), update.value);
+        }
+        Ok(())
+    })
 }
 
 /// A big-endian integer without its leading zero bytes, as the table stores
