@@ -181,13 +181,30 @@ impl Manifest {
         serde_json::from_str(s).map_err(|e| e.to_string())
     }
 
-    /// Short fingerprint of the service configuration (the CRS seed pins
-    /// everything else). Part of every response stamp, so a client that
-    /// reaches a server with a DIFFERENT configuration — another deployment,
-    /// or an operator reconfiguration — detects it and re-fetches the
-    /// manifest.
+    /// Short fingerprint of the service configuration. Part of every response
+    /// stamp, so a client that reaches a server with a DIFFERENT configuration
+    /// — another deployment, or an operator reconfiguration — detects it and
+    /// re-fetches the manifest.
+    ///
+    /// For an account table it is the head of the CRS seed, which pins the
+    /// rest. A storage table can share its seed with an account table, since
+    /// the CRS is public, and the two can even take queries and answers of the
+    /// same size. So its fingerprint also covers the contracts it holds, and a
+    /// client sent to the wrong table notices instead of reading every slot as
+    /// empty.
     pub fn config_fp(&self) -> String {
-        self.pir.crs_seed_hex[..16.min(self.pir.crs_seed_hex.len())].to_string()
+        let seed = &self.pir.crs_seed_hex;
+        if self.cuckoo.contracts.is_empty() {
+            return seed[..16.min(seed.len())].to_string();
+        }
+        use sha3::Digest;
+        let mut hasher = sha3::Keccak256::new();
+        hasher.update(seed.as_bytes());
+        for contract in &self.cuckoo.contracts {
+            hasher.update(b",");
+            hasher.update(contract.to_ascii_lowercase().as_bytes());
+        }
+        hex::encode(&hasher.finalize()[..8])
     }
 
     /// The X-Snapshot stamp for responses served at `snapshot_block`:
@@ -240,6 +257,20 @@ mod tests {
         let h = m2.cuckoo.hasher().unwrap();
         assert_eq!(h.num_buckets, 1 << 27);
         assert_eq!(m2.stamp_for(42), format!("42:{}", "5a".repeat(8)));
+
+        // A storage table on the same seed gets a fingerprint of its own,
+        // while the account table's stays the head of the seed, as clients
+        // built before storage tables expect.
+        let mut tokens = m2.clone();
+        tokens.cuckoo.key_derivation = KeyDerivation::Storage;
+        tokens.cuckoo.contracts = vec!["0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".into()];
+        assert_eq!(tokens.config_fp().len(), 16);
+        assert_ne!(tokens.config_fp(), m2.config_fp());
+        let mut lower = tokens.clone();
+        lower.cuckoo.contracts = vec!["0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".into()];
+        assert_eq!(lower.config_fp(), tokens.config_fp());
+        lower.cuckoo.contracts.push("0xdac17f958d2ee523a2206206994597c13d831ec7".into());
+        assert_ne!(lower.config_fp(), tokens.config_fp());
     }
 
     #[test]
