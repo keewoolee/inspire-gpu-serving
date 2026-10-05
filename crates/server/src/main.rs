@@ -1,11 +1,12 @@
-//! The serving binary: load accounts (CSV snapshot or synthetic), build the
-//! first generation, and serve the HTTP API. With --eth-rpc it also follows
+//! The serving binary: load a snapshot (accounts or contract storage, from
+//! CSV) or synthetic accounts, build the first generation, and serve the HTTP
+//! API. With --eth-rpc it also follows
 //! the chain (sidecar + periodic generation flips); without it, it serves the
 //! snapshot statically.
 
 use clap::Parser;
 use pir_keyword::cuckoo::{CuckooParams, CuckooTable, DETERMINISTIC_SEED};
-use pir_server::follower::{self, FollowerConfig, SimulatorConfig};
+use pir_server::follower::{self, Feed, FollowerConfig, SimulatorConfig};
 use pir_server::generation::{GenerationBuilder, ServingState};
 use pir_server::http::serve;
 use pir_server::sidecar::Sidecar;
@@ -19,6 +20,12 @@ struct Args {
     /// Accounts CSV snapshot (address,nonce,balance_wei; `# block=N` header).
     #[clap(long, conflicts_with = "synthetic")]
     accounts_csv: Option<String>,
+
+    /// Storage CSV snapshot instead (key,value; `# block=N` and
+    /// `# contracts=…` header), as `ethrex-statedump --storage-of` writes it.
+    /// The follower then tracks those contracts' storage, not accounts.
+    #[clap(long, conflicts_with_all = ["accounts_csv", "synthetic", "simulate"])]
+    storage_csv: Option<String>,
 
     /// Serve N synthetic accounts instead of a snapshot.
     #[clap(long)]
@@ -91,21 +98,30 @@ fn main() {
     let params = CuckooParams::new(args.buckets, 20, 40, DETERMINISTIC_SEED);
     let mut table = CuckooTable::new(params);
     let snapshot_block;
-    match (&args.accounts_csv, args.synthetic) {
-        (Some(csv), _) => {
+    let mut feed = Feed::Accounts;
+    match (&args.accounts_csv, &args.storage_csv, args.synthetic) {
+        (Some(csv), _, _) => {
             let (block, n) = table
                 .build_from_csv(Path::new(csv))
                 .expect("failed to load snapshot CSV");
             eprintln!("Snapshot: {} accounts at block #{}", n, block);
             snapshot_block = block;
         }
-        (None, Some(n)) => {
+        (None, Some(csv), _) => {
+            let (block, n) = table
+                .build_from_storage_csv(Path::new(csv))
+                .expect("failed to load storage CSV");
+            eprintln!("Snapshot: {} storage slots at block #{}", n, block);
+            snapshot_block = block;
+            feed = Feed::Storage(table.params.contracts.clone());
+        }
+        (None, None, Some(n)) => {
             eprintln!("Building {} synthetic accounts...", n);
             table.build_accounts_parallel(n);
             snapshot_block = 0;
         }
-        (None, None) => {
-            eprintln!("error: pass --accounts-csv or --synthetic N");
+        (None, None, None) => {
+            eprintln!("error: pass --accounts-csv, --storage-csv or --synthetic N");
             std::process::exit(2);
         }
     }
@@ -176,6 +192,7 @@ fn main() {
         let cfg = FollowerConfig {
             rebuild_every: Duration::from_secs(args.rebuild_secs),
             poll_every: Duration::from_secs(3),
+            feed,
         };
         std::thread::spawn(move || follower::run(rpc, builder, state2, snapshot_block, cfg));
         eprintln!(

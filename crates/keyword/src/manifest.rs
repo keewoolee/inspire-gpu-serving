@@ -8,9 +8,9 @@
 use crate::cuckoo::CuckooHash;
 use serde::{Deserialize, Serialize};
 
-/// How a lookup key is derived from an account address. A client has to agree
-/// with the table it is querying, so the server publishes which one is in use
-/// rather than leaving it to be configured on both sides.
+/// How a lookup key is derived from what the client is asking about. A client
+/// has to agree with the table it is querying, so the server publishes which
+/// one is in use rather than leaving it to be configured on both sides.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum KeyDerivation {
@@ -22,16 +22,31 @@ pub enum KeyDerivation {
     /// hash and a hash cannot be turned back into an address. It costs the
     /// client nothing, since it knows the address it is asking about.
     Keccak,
+    /// A contract storage slot: keccak256(keccak256(contract) ‖
+    /// keccak256(slot)), cut to the key size, for the same reason (see
+    /// [`crate::storage`]).
+    Storage,
 }
 
 impl KeyDerivation {
-    /// The lookup key for `address` under this derivation.
-    pub fn key(&self, address: &[u8], key_size: usize) -> Vec<u8> {
+    /// The lookup key for `input` under this derivation. `input` is an address
+    /// for `Address` and `Keccak`, and the contract's address followed by the
+    /// 32-byte slot for `Storage`.
+    pub fn key(&self, input: &[u8], key_size: usize) -> Vec<u8> {
         match self {
-            KeyDerivation::Address => address.to_vec(),
+            KeyDerivation::Address => input.to_vec(),
             KeyDerivation::Keccak => {
                 use sha3::Digest;
-                sha3::Keccak256::digest(address)[..key_size.min(32)].to_vec()
+                sha3::Keccak256::digest(input)[..key_size.min(32)].to_vec()
+            }
+            KeyDerivation::Storage => {
+                assert_eq!(input.len(), 52, "a storage key is derived from contract ‖ slot");
+                let (contract, slot) = input.split_at(20);
+                crate::storage::storage_key(
+                    contract.try_into().unwrap(),
+                    slot.try_into().unwrap(),
+                    key_size,
+                )
             }
         }
     }
@@ -53,6 +68,12 @@ pub struct CuckooManifest {
     /// only have been an address-keyed table.
     #[serde(default)]
     pub key_derivation: KeyDerivation,
+    /// The contracts whose storage a `storage`-keyed table holds, as 0x-hex.
+    /// A slot of any other contract is simply not in the table, and would
+    /// read as empty, so a client checks this list before looking one up.
+    /// Empty, and left out of the JSON, for an account table.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contracts: Vec<String>,
 }
 
 impl CuckooManifest {
@@ -197,6 +218,7 @@ mod tests {
                 num_hashes: 2,
                 seed_hex: hex::encode(DETERMINISTIC_SEED),
                 key_derivation: KeyDerivation::Address,
+                contracts: vec![],
             },
             pir: PirManifest {
                 n_entries: 1 << 27,
@@ -258,6 +280,31 @@ mod tests {
             serde_json::to_string(&KeyDerivation::Address).unwrap(),
             "\"address\""
         );
+        assert_eq!(
+            serde_json::to_string(&KeyDerivation::Storage).unwrap(),
+            "\"storage\""
+        );
+    }
+
+    /// An account table's manifest stays exactly as it was, and a storage
+    /// table's names its contracts.
+    #[test]
+    fn contracts_appear_only_in_a_storage_manifest() {
+        let mut c = CuckooManifest {
+            num_buckets: 16,
+            key_size: 20,
+            value_size: 40,
+            bucket_capacity: 2,
+            num_hashes: 2,
+            seed_hex: "00".into(),
+            key_derivation: KeyDerivation::Keccak,
+            contracts: vec![],
+        };
+        assert!(!serde_json::to_string(&c).unwrap().contains("contracts"));
+        c.key_derivation = KeyDerivation::Storage;
+        c.contracts = vec!["0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".into()];
+        let back: CuckooManifest = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(back, c);
     }
 
     /// The address derivation hands the address back; the keccak one hands back
@@ -270,6 +317,19 @@ mod tests {
         assert_eq!(
             hex::encode(KeyDerivation::Keccak.key(&address, 20)),
             "06e120c2c3547c60ee47f712d32e5acf38b35d1c"
+        );
+    }
+
+    /// The storage derivation takes contract ‖ slot and agrees with the
+    /// storage module, which the dump and the follower call directly.
+    #[test]
+    fn the_storage_derivation_is_the_storage_key() {
+        let contract: [u8; 20] = [0xa0; 20];
+        let slot = [0x1f; 32];
+        let input = [&contract[..], &slot[..]].concat();
+        assert_eq!(
+            KeyDerivation::Storage.key(&input, 20),
+            crate::storage::storage_key(&contract, &slot, 20)
         );
     }
 }

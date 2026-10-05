@@ -11,7 +11,10 @@
 //!   backend ingests.
 //! - [`manifest`]: the static service manifest (fetched once at client
 //!   setup) and the sidecar-broadcast wire types.
+//! - [`storage`]: keys and values for a table of contract storage slots,
+//!   such as the ones holding token balances.
 
 pub mod cuckoo;
 pub mod manifest;
 pub mod slots;
+pub mod storage;

@@ -5,6 +5,7 @@
 use crate::generation::{GenerationBuilder, ServingState};
 use pir_chain::rpc::{account_update_to_value, EthRpc};
 use pir_keyword::cuckoo::address_from_index;
+use pir_keyword::storage::storage_value;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -13,6 +14,51 @@ pub struct FollowerConfig {
     pub rebuild_every: Duration,
     /// Poll the chain head this often.
     pub poll_every: Duration,
+    /// What the served table holds, and so what to take from each block.
+    pub feed: Feed,
+}
+
+/// What a table follows the chain for.
+pub enum Feed {
+    /// Every account's balance and nonce.
+    Accounts,
+    /// Every storage slot of these contracts.
+    Storage(Vec<[u8; 20]>),
+}
+
+/// Apply one block's changes to the host-side truth and the sidecar, and
+/// return how many there were.
+fn ingest_block(
+    rpc: &EthRpc,
+    feed: &Feed,
+    block: u64,
+    builder: &Mutex<GenerationBuilder>,
+    state: &ServingState,
+) -> Result<usize, String> {
+    match feed {
+        Feed::Accounts => {
+            let (_, updates) = rpc.fetch_block_updates(block)?;
+            let mut bld = builder.lock().unwrap();
+            for u in &updates {
+                let value = account_update_to_value(u);
+                let key = bld.apply_account(&u.address, &value);
+                state.sidecar.push(&key, &value, block);
+            }
+            Ok(updates.len())
+        }
+        Feed::Storage(contracts) => {
+            let updates = rpc.fetch_block_storage_updates(block, contracts)?;
+            let mut bld = builder.lock().unwrap();
+            for u in &updates {
+                // An emptied slot is written as zero rather than deleted: it
+                // reads the same, and the sidecar can carry it.
+                let value = storage_value(&u.value);
+                let key = bld.apply_storage(&u.contract, &u.slot, &value);
+                state.sidecar.push(&key, &value, block);
+            }
+            Ok(updates.len())
+        }
+    }
 }
 
 /// Runs forever. Call from a dedicated thread.
@@ -39,21 +85,19 @@ pub fn run(
         match rpc.block_number() {
             Ok(head) if head > synced_to => {
                 for b in (synced_to + 1)..=head {
-                    match rpc.fetch_block_updates(b) {
-                        Ok((_, updates)) => {
+                    match ingest_block(&rpc, &cfg.feed, b, &builder, &state) {
+                        Ok(changes) => {
                             fail_streak = 0;
-                            let mut bld = builder.lock().unwrap();
-                            for u in &updates {
-                                let value = account_update_to_value(u);
-                                let key = bld.apply_account(&u.address, &value);
-                                state.sidecar.push(&key, &value, b);
-                            }
                             synced_to = b;
-                            if !updates.is_empty() {
+                            if changes > 0 {
                                 eprintln!(
-                                    "block #{}: {} account changes (sidecar {} entries)",
+                                    "block #{}: {} {} changes (sidecar {} entries)",
                                     b,
-                                    updates.len(),
+                                    changes,
+                                    match cfg.feed {
+                                        Feed::Accounts => "account",
+                                        Feed::Storage(_) => "storage",
+                                    },
                                     state.sidecar.len()
                                 );
                             }

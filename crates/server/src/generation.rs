@@ -17,6 +17,7 @@ use pir_backend_ffi::{GpuServer, Params};
 use pir_keyword::cuckoo::{canary_value, CuckooTable, CANARY_ADDRESS};
 use pir_keyword::manifest::{CuckooManifest, Manifest, StashEntry};
 use pir_keyword::slots::{slot_db_cols, to_slot_db, write_bucket_to_slot_db};
+use pir_keyword::storage::storage_key;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -121,6 +122,16 @@ impl GenerationBuilder {
         key
     }
 
+    /// Apply a storage slot's new value in a storage table, deriving its key
+    /// the way the table is keyed, and hand the key back for the sidecar. The
+    /// same trap as for accounts applies: a key derived any other way is a
+    /// different entry.
+    pub fn apply_storage(&mut self, contract: &[u8; 20], slot: &[u8; 32], value: &[u8]) -> Vec<u8> {
+        let key = storage_key(contract, slot, self.table.params.key_size);
+        self.apply_update(&key, value);
+        key
+    }
+
     /// Apply a value under a key that is already derived. The canary is a
     /// reserved key rather than an account, so it goes in as itself.
     pub fn apply_update(&mut self, key: &[u8], value: &[u8]) {
@@ -153,12 +164,18 @@ impl GenerationBuilder {
         // The counter only advances on success, so a failing GPU build
         // retried in a loop does not burn numbers in the logs.
         self.builds += 1;
+        // Cuckoo insertion degrades past ~0.9 of the cells, so the load is
+        // worth watching on a table that grows.
+        let params = &self.table.params;
+        let cells: usize = self.table.used.iter().map(|&u| u as usize).sum();
+        let load = cells as f64 / (params.num_buckets * params.bucket_capacity) as f64;
         eprintln!(
-            "generation {} built in {:.1}s (snapshot block #{}, {:.2} GB resident)",
+            "generation {} built in {:.1}s (snapshot block #{}, {:.2} GB resident, {:.1}% of cells used)",
             self.builds,
             t0.elapsed().as_secs_f64(),
             snapshot_block,
             srv.caps().resident_bytes as f64 / 1e9,
+            100.0 * load,
         );
 
         let ks = self.table.params.key_size;
@@ -187,6 +204,13 @@ impl GenerationBuilder {
                 num_hashes: self.table.params.num_hashes,
                 seed_hex: hex::encode(self.table.params.seed),
                 key_derivation: self.table.params.key_derivation,
+                contracts: self
+                    .table
+                    .params
+                    .contracts
+                    .iter()
+                    .map(|c| format!("0x{}", hex::encode(c)))
+                    .collect(),
             },
             pir: srv.params().to_manifest(),
         };

@@ -27,6 +27,17 @@ use std::time::Instant;
 /// Max cell size for stack-allocated cells (key 20 + value 40).
 const MAX_CELL_SIZE: usize = 64;
 
+/// Hex with or without 0x. An odd digit count is a big-endian integer missing
+/// its leading zero, which hex::decode would reject, so it gets one back.
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    let digits = s.strip_prefix("0x").unwrap_or(s);
+    if digits.len() % 2 == 1 {
+        hex::decode(format!("0{digits}")).ok()
+    } else {
+        hex::decode(digits).ok()
+    }
+}
+
 /// Deterministic address from index: SHAKE-256(i as u64 LE) → first 20 bytes.
 pub fn address_from_index(i: usize) -> Vec<u8> {
     let mut hasher = Shake256::default();
@@ -96,6 +107,9 @@ pub struct CuckooParams {
     /// What the keys in this table are. Set from the snapshot that filled it,
     /// and published in the manifest so a client derives keys the same way.
     pub key_derivation: KeyDerivation,
+    /// For a storage table, the contracts whose slots it holds. Also set from
+    /// the snapshot, and published alongside the key derivation.
+    pub contracts: Vec<[u8; 20]>,
 }
 
 impl CuckooParams {
@@ -109,6 +123,7 @@ impl CuckooParams {
             max_evictions: 10_000,
             seed,
             key_derivation: KeyDerivation::Address,
+            contracts: Vec::new(),
         }
     }
 
@@ -604,6 +619,95 @@ impl CuckooTable {
         Ok((block_number, num_accounts))
     }
 
+    /// Build from a storage snapshot CSV, as `ethrex-statedump --storage-of`
+    /// writes it: comment lines `# block=N`, `# key_derivation=storage` and
+    /// `# contracts=0x…,0x…`, the header `key,value`, then one row per slot
+    /// holding its derived key and its value, both hex. The file is generated,
+    /// so anything malformed stops the load rather than leaving a table that is
+    /// quietly missing slots. Returns (block_number, slots inserted).
+    pub fn build_from_storage_csv(&mut self, path: &Path) -> io::Result<(u64, usize)> {
+        let reader = BufReader::with_capacity(64 * 1024 * 1024, File::open(path)?);
+        let (ks, vs) = (self.params.key_size, self.params.value_size);
+        let invalid = |line: usize, what: String| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("line {line}: {what}"))
+        };
+        let t0 = Instant::now();
+        let mut rng = fastrand::Rng::new();
+        let (mut block_number, mut slots) = (None, 0usize);
+        let mut header_seen = false;
+        self.params.key_derivation = KeyDerivation::Storage;
+        self.params.contracts.clear();
+
+        for (i, line) in reader.lines().enumerate() {
+            let line = line?;
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(meta) = line.strip_prefix('#') {
+                let meta = meta.trim();
+                if let Some(n) = meta.strip_prefix("block=") {
+                    let n = n.trim().parse().map_err(|_| invalid(i + 1, format!("bad block {n:?}")))?;
+                    block_number = Some(n);
+                } else if let Some(name) = meta.strip_prefix("key_derivation=") {
+                    if name.trim() != "storage" {
+                        return Err(invalid(i + 1, format!("not a storage snapshot: {name:?}")));
+                    }
+                } else if let Some(list) = meta.strip_prefix("contracts=") {
+                    for c in list.split(',') {
+                        let bytes = decode_hex(c.trim()).filter(|b| b.len() == 20);
+                        let contract = bytes.ok_or_else(|| invalid(i + 1, format!("bad contract {c:?}")))?;
+                        self.params.contracts.push(contract.try_into().unwrap());
+                    }
+                }
+                continue;
+            }
+            if !header_seen {
+                if line != "key,value" {
+                    return Err(invalid(i + 1, format!("expected the header key,value, not {line:?}")));
+                }
+                header_seen = true;
+                continue;
+            }
+
+            let (key_hex, value_hex) = line
+                .split_once(',')
+                .ok_or_else(|| invalid(i + 1, "expected key,value".into()))?;
+            let key = decode_hex(key_hex)
+                .filter(|k| k.len() == ks)
+                .ok_or_else(|| invalid(i + 1, format!("bad key {key_hex:?}")))?;
+            let value = decode_hex(value_hex)
+                .filter(|v| v.len() <= vs)
+                .ok_or_else(|| invalid(i + 1, format!("bad value {value_hex:?}")))?;
+            // The value is a big-endian integer, so it sits at the end of the
+            // value field, behind zeros.
+            let mut cell = [0u8; MAX_CELL_SIZE];
+            cell[..ks].copy_from_slice(&key);
+            cell[ks + vs - value.len()..ks + vs].copy_from_slice(&value);
+            self.insert_fast(&cell, &mut rng);
+            slots += 1;
+
+            if slots % 4_000_000 == 0 {
+                let rate = slots as f64 / t0.elapsed().as_secs_f64();
+                eprint!("\r  Loading storage CSV... {}M slots ({:.0}k/s)    ", slots / 1_000_000, rate / 1000.0);
+            }
+        }
+
+        let block_number = block_number
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no `# block=` line"))?;
+        if self.params.contracts.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "no `# contracts=` line"));
+        }
+        eprintln!(
+            "\r  Storage CSV loaded: {} slots of {} contracts at block #{} ({:.1}s)              ",
+            slots,
+            self.params.contracts.len(),
+            block_number,
+            t0.elapsed().as_secs_f64()
+        );
+        Ok((block_number, slots))
+    }
+
     /// Export all occupied cells to CSV format: `address,nonce,balance_wei`.
     /// First line is `# block=BLOCK_NUMBER`, second line is the header.
     pub fn export_csv(&self, path: &Path, block_number: u64) -> io::Result<usize> {
@@ -836,5 +940,62 @@ mod tests {
         let mut table = CuckooTable::new(CuckooParams::new(128, 20, 40, DETERMINISTIC_SEED));
         table.build_from_csv(&path).unwrap();
         assert_eq!(table.params.key_derivation, KeyDerivation::Address);
+    }
+
+    fn write_storage_csv(name: &str, lines: &[&str]) -> std::path::PathBuf {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(name);
+        let mut f = File::create(&path).unwrap();
+        for line in lines {
+            writeln!(f, "{line}").unwrap();
+        }
+        path
+    }
+
+    /// A storage snapshot carries its block, its contracts and its keys, and a
+    /// value lands right-aligned in the value field, where the client and the
+    /// follower put it.
+    #[test]
+    fn build_from_storage_csv_reads_slots_and_metadata() {
+        let path = write_storage_csv(
+            "storage_ok.csv",
+            &[
+                "# block=26128182",
+                "# key_derivation=storage",
+                "# contracts=0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48,0xdac17f958d2ee523a2206206994597c13d831ec7",
+                "key,value",
+                "d6a3e40d689f6d6eec2db745e1a538aac45c7e87,4438f6820aa3",
+                "00000000219ab540356cbb839cbe05303d7705fa,ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            ],
+        );
+        let mut table = CuckooTable::new(CuckooParams::new(128, 20, 40, DETERMINISTIC_SEED));
+        assert_eq!(table.build_from_storage_csv(&path).unwrap(), (26128182, 2));
+        assert_eq!(table.params.key_derivation, KeyDerivation::Storage);
+        assert_eq!(table.params.contracts.len(), 2);
+        assert_eq!(hex::encode(table.params.contracts[1]), "dac17f958d2ee523a2206206994597c13d831ec7");
+
+        let key = hex::decode("d6a3e40d689f6d6eec2db745e1a538aac45c7e87").unwrap();
+        let mut word = [0u8; 32];
+        word[26..].copy_from_slice(&hex::decode("4438f6820aa3").unwrap());
+        assert_eq!(table.lookup(&key).unwrap(), crate::storage::storage_value(&word).as_slice());
+        let unlimited = hex::decode("00000000219ab540356cbb839cbe05303d7705fa").unwrap();
+        assert_eq!(crate::storage::parse_storage_value(table.lookup(&unlimited).unwrap()), Some([0xff; 32]));
+    }
+
+    /// A file that is not a storage snapshot, or is cut short of its metadata,
+    /// is refused rather than half loaded.
+    #[test]
+    fn build_from_storage_csv_refuses_what_it_cannot_trust() {
+        let cases: [(&str, &[&str]); 4] = [
+            ("storage_kd.csv", &["# block=1", "# key_derivation=keccak", "# contracts=0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", "key,value"]),
+            ("storage_nocontracts.csv", &["# block=1", "key,value", "d6a3e40d689f6d6eec2db745e1a538aac45c7e87,01"]),
+            ("storage_noblock.csv", &["# contracts=0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", "key,value"]),
+            ("storage_shortkey.csv", &["# block=1", "# contracts=0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", "key,value", "d6a3,01"]),
+        ];
+        for (name, lines) in cases {
+            let path = write_storage_csv(name, lines);
+            let mut table = CuckooTable::new(CuckooParams::new(128, 20, 40, DETERMINISTIC_SEED));
+            assert!(table.build_from_storage_csv(&path).is_err(), "{name}");
+        }
     }
 }

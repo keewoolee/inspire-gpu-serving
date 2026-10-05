@@ -34,6 +34,15 @@ pub struct AccountUpdate {
     pub nonce: u64,
 }
 
+/// A contract storage slot's value at the end of a block. Zero means the
+/// block emptied the slot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StorageUpdate {
+    pub contract: [u8; 20],
+    pub slot: [u8; 32],
+    pub value: [u8; 32],
+}
+
 impl EthRpc {
     pub fn new(url: &str) -> Self {
         let agent = ureq::Agent::new_with_defaults();
@@ -230,6 +239,23 @@ impl EthRpc {
         let result = self.call("debug_traceBlockByNumber", json!([block_hex, config]))?;
         let traces = result.as_array().ok_or("trace result is not an array")?;
         Ok(updates_from_prestate_diff(traces))
+    }
+
+    /// Fetch the storage changes a block made to `contracts`, from the same
+    /// state diff. There is no fallback, unlike for accounts: a transaction's
+    /// from and to say nothing about storage, so an endpoint without the
+    /// `debug` namespace, or a block older than the node can trace, is an
+    /// error for the caller to surface rather than a gap to paper over.
+    pub fn fetch_block_storage_updates(
+        &self,
+        block_num: u64,
+        contracts: &[[u8; 20]],
+    ) -> Result<Vec<StorageUpdate>, String> {
+        let block_hex = format!("0x{:x}", block_num);
+        let config = json!({"tracer": "prestateTracer", "tracerConfig": {"diffMode": true}});
+        let result = self.call("debug_traceBlockByNumber", json!([block_hex, config]))?;
+        let traces = result.as_array().ok_or("trace result is not an array")?;
+        storage_updates_from_prestate_diff(traces, contracts)
     }
 
     /// Fetch a block and return all account state changes.
@@ -632,6 +658,90 @@ fn updates_from_prestate_diff(traces: &[Value]) -> Vec<AccountUpdate> {
         .collect()
 }
 
+/// Fold a block's per-transaction prestate diffs into the end-of-block value of
+/// every slot of `contracts` the block changed.
+///
+/// In diff mode `pre` holds the old value of each slot a transaction changed
+/// and `post` the new one, except that a slot set to zero is left out of
+/// `post`, so a slot in `pre` but not in `post` went to zero. Checked against
+/// `eth_getStorageAt` on an ethrex node: 2,770 token slot changes over 10
+/// mainnet blocks, 399 of them to zero, all matched. Later transactions
+/// overwrite earlier ones, leaving the block's end state.
+fn storage_updates_from_prestate_diff(
+    traces: &[Value],
+    contracts: &[[u8; 20]],
+) -> Result<Vec<StorageUpdate>, String> {
+    let mut state: HashMap<([u8; 20], [u8; 32]), [u8; 32]> = HashMap::new();
+    let mut order: Vec<([u8; 20], [u8; 32])> = Vec::new();
+    let mut record = |contract: [u8; 20], slot: [u8; 32], value: [u8; 32]| {
+        if state.insert((contract, slot), value).is_none() {
+            order.push((contract, slot));
+        }
+    };
+
+    for trace in traces {
+        let inner = trace.get("result").unwrap_or(trace);
+        let pre = inner.get("pre").and_then(|v| v.as_object());
+        let post = inner.get("post").and_then(|v| v.as_object());
+        let storage_of = |side: Option<&serde_json::Map<String, Value>>, address_hex: &str| {
+            side.and_then(|s| s.get(address_hex))
+                .and_then(|account| account.get("storage"))
+                .and_then(|storage| storage.as_object())
+                .cloned()
+        };
+        // An account whose changed slots all went to zero may appear in `pre`
+        // alone, so walk both sides.
+        let mut addresses: Vec<&String> = pre.into_iter().flat_map(|p| p.keys()).collect();
+        addresses.extend(post.into_iter().flat_map(|p| p.keys()));
+        addresses.sort();
+        addresses.dedup();
+
+        for address_hex in addresses {
+            let contract: [u8; 20] = match parse_hex_address(address_hex) {
+                Some(address) => address.try_into().unwrap(),
+                None => continue,
+            };
+            if !contracts.contains(&contract) {
+                continue;
+            }
+            let before = storage_of(pre, address_hex).unwrap_or_default();
+            let after = storage_of(post, address_hex).unwrap_or_default();
+            for (slot_hex, value) in &after {
+                let slot = parse_hex_word(slot_hex).ok_or(format!("bad slot {slot_hex}"))?;
+                let value = value
+                    .as_str()
+                    .and_then(parse_hex_word)
+                    .ok_or(format!("bad value for slot {slot_hex}"))?;
+                record(contract, slot, value);
+            }
+            for slot_hex in before.keys().filter(|slot| !after.contains_key(*slot)) {
+                let slot = parse_hex_word(slot_hex).ok_or(format!("bad slot {slot_hex}"))?;
+                record(contract, slot, [0u8; 32]);
+            }
+        }
+    }
+
+    Ok(order
+        .into_iter()
+        .map(|(contract, slot)| StorageUpdate {
+            contract,
+            slot,
+            value: state[&(contract, slot)],
+        })
+        .collect())
+}
+
+/// A 32-byte word from hex, right-aligned, as storage slots and their values
+/// arrive (usually padded to 64 digits, but minimal hex is read too).
+fn parse_hex_word(s: &str) -> Option<[u8; 32]> {
+    let digits = s.strip_prefix("0x").unwrap_or(s);
+    if digits.len() > 64 {
+        return None;
+    }
+    let raw = hex::decode(format!("{:0>64}", digits)).ok()?;
+    raw.try_into().ok()
+}
+
 /// A field of a prestate diff entry, taken from the post state when the
 /// transaction changed it and from the pre state when it did not.
 fn pick_field<'a>(post: &'a Value, pre: Option<&'a Value>, field: &str) -> Option<&'a Value> {
@@ -798,5 +908,92 @@ mod tests {
             "RPC error: {\"code\":-32601,\"message\":\"Method not found: debug_traceBlockByNumber\"}"
         ));
         assert!(!is_unsupported_method("RPC error: {\"code\":-32000}"));
+    }
+
+    const USDT: &str = "0xdac17f958d2ee523a2206206994597c13d831ec7";
+
+    fn usdt() -> [u8; 20] {
+        parse_hex_address(USDT).unwrap().try_into().unwrap()
+    }
+
+    fn word(hex: &str) -> [u8; 32] {
+        parse_hex_word(hex).unwrap()
+    }
+
+    fn value_of(updates: &[StorageUpdate], slot: &str) -> [u8; 32] {
+        updates
+            .iter()
+            .find(|u| u.slot == word(slot))
+            .unwrap_or_else(|| panic!("no update for {slot}"))
+            .value
+    }
+
+    /// One transaction's USDT diff exactly as an ethrex node returned it
+    /// (block 26,128,349), cut to three slots: one emptied, so it is in `pre`
+    /// alone, one created, so it is in `post` alone, and one changed.
+    #[test]
+    fn storage_diff_from_a_real_block() {
+        let traces = vec![json!({
+            "txHash": "0xc200840c99a5b61ef3fe86abe1cee2d917257cd59cd435aea9aecbc3530159f7",
+            "result": {
+                "pre": { USDT: { "storage": {
+                    "0x57c6e74a94dc6c6b73e1a11d41c41f61dc139d88b2ea858fb8c7ed5be349facc": "0x000000000000000000000000000000000000000000000000000000000cb3d895",
+                    "0x8fafb133c724b15b2b281e4b0cfe79f90a1b043ef0bb35747a95949ced0c8c86": "0x00000000000000000000000000000000000000000000000000000000a8ad9716"
+                }}},
+                "post": { USDT: { "storage": {
+                    "0x7e0f773e549c4e14fe5e51f5ac84e164124a89ccbf97234649b7ff00c1923202": "0x000000000000000000000000000000000000000000000000000000000ca0abff",
+                    "0x8fafb133c724b15b2b281e4b0cfe79f90a1b043ef0bb35747a95949ced0c8c86": "0x00000000000000000000000000000000000000000000000000000000a8c0c3ac"
+                }}}
+            }
+        })];
+        let updates = storage_updates_from_prestate_diff(&traces, &[usdt()]).unwrap();
+        assert_eq!(updates.len(), 3);
+        assert!(updates.iter().all(|u| u.contract == usdt()));
+        assert_eq!(
+            value_of(&updates, "0x57c6e74a94dc6c6b73e1a11d41c41f61dc139d88b2ea858fb8c7ed5be349facc"),
+            [0u8; 32]
+        );
+        assert_eq!(
+            value_of(&updates, "0x7e0f773e549c4e14fe5e51f5ac84e164124a89ccbf97234649b7ff00c1923202"),
+            word("0xca0abff")
+        );
+        assert_eq!(
+            value_of(&updates, "0x8fafb133c724b15b2b281e4b0cfe79f90a1b043ef0bb35747a95949ced0c8c86"),
+            word("0xa8c0c3ac")
+        );
+    }
+
+    /// The last transaction to touch a slot decides its value, including
+    /// emptying a slot an earlier transaction filled, and contracts nobody
+    /// asked for are left out.
+    #[test]
+    fn storage_diff_folds_transactions_and_filters_contracts() {
+        let other = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+        let traces = vec![
+            json!({"result": {
+                "pre": {},
+                "post": { USDT: { "storage": { "0x01": "0x05", "0x02": "0x07" } },
+                          other: { "storage": { "0x01": "0x09" } } }
+            }}),
+            json!({"result": {
+                "pre": { USDT: { "storage": { "0x01": "0x05" } } },
+                "post": { USDT: { "balance": "0x0" } }
+            }}),
+        ];
+        let updates = storage_updates_from_prestate_diff(&traces, &[usdt()]).unwrap();
+        assert_eq!(updates.len(), 2);
+        assert_eq!(value_of(&updates, "0x01"), [0u8; 32]);
+        assert_eq!(value_of(&updates, "0x02"), word("0x07"));
+    }
+
+    /// Malformed hex from the node stops the block instead of writing a wrong
+    /// value into the table.
+    #[test]
+    fn storage_diff_refuses_malformed_values() {
+        let traces = vec![json!({"result": {
+            "pre": {},
+            "post": { USDT: { "storage": { "0x01": "0xnot-hex" } } }
+        }})];
+        assert!(storage_updates_from_prestate_diff(&traces, &[usdt()]).is_err());
     }
 }

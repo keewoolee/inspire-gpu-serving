@@ -26,8 +26,9 @@
 
 use pir_backend_ffi::{pack_query, ClientQuery, Params};
 use pir_keyword::cuckoo::{CuckooHash, CANARY_ADDRESS};
-use pir_keyword::manifest::{Manifest, SidecarBroadcast};
+use pir_keyword::manifest::{KeyDerivation, Manifest, SidecarBroadcast};
 use pir_keyword::slots::unpack_bytes;
+use pir_keyword::storage::{mapping_slot, parse_storage_value, storage_key};
 
 /// Where a lookup result came from.
 #[derive(Clone, Debug, PartialEq)]
@@ -60,6 +61,80 @@ pub fn parse_account_value(v: &[u8]) -> Option<AccountValue> {
         balance: u128::from_be_bytes(v[16..32].try_into().unwrap()),
         nonce: u64::from_be_bytes(v[32..40].try_into().unwrap()),
     })
+}
+
+/// An ERC-20 token whose balances a storage table can answer for: where its
+/// balances mapping sits, and how to read an entry of it.
+#[derive(Clone, Copy, Debug)]
+pub struct Token {
+    pub symbol: &'static str,
+    /// The contract, 0x-hex.
+    pub address: &'static str,
+    /// Storage slot of the balances mapping.
+    pub balances_slot: u64,
+    pub decimals: u32,
+    /// The top bit of a balance entry is a flag rather than part of the
+    /// balance. USDC keeps its blacklist there.
+    pub flag_in_top_bit: bool,
+}
+
+/// The four tokens kohaku-cli syncs by default. Each balances slot was checked
+/// against `balanceOf` on mainnet at block 26,128,248. A wallet that asks for
+/// one of them asks for all four, every time, so that which tokens it holds
+/// does not show in how many lookups it sends.
+pub const TOKENS: [Token; 4] = [
+    Token {
+        symbol: "USDC",
+        address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+        balances_slot: 9,
+        decimals: 6,
+        flag_in_top_bit: true,
+    },
+    Token {
+        symbol: "USDT",
+        address: "0xdac17f958d2ee523a2206206994597c13d831ec7",
+        balances_slot: 2,
+        decimals: 6,
+        flag_in_top_bit: false,
+    },
+    Token {
+        symbol: "DAI",
+        address: "0x6b175474e89094c44da98b954eedeac495271d0f",
+        balances_slot: 2,
+        decimals: 18,
+        flag_in_top_bit: false,
+    },
+    Token {
+        symbol: "WETH",
+        address: "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+        balances_slot: 3,
+        decimals: 18,
+        flag_in_top_bit: false,
+    },
+];
+
+impl Token {
+    pub fn contract(&self) -> [u8; 20] {
+        let digits = self.address.strip_prefix("0x").unwrap_or(self.address);
+        hex::decode(digits).unwrap().try_into().unwrap()
+    }
+
+    /// The balance a storage word holds, as `balanceOf` would return it.
+    pub fn balance_from_word(&self, mut word: [u8; 32]) -> [u8; 32] {
+        if self.flag_in_top_bit {
+            word[0] &= 0x7f;
+        }
+        word
+    }
+}
+
+/// A token balance as `balanceOf` returns it (32 bytes, big-endian), and where
+/// it came from. No source means the table proved the slot empty, which is a
+/// zero balance.
+#[derive(Clone, Debug)]
+pub struct TokenBalance {
+    pub balance: [u8; 32],
+    pub source: Option<Source>,
 }
 
 /// Cap on a response body. A lookup carries the whole sidecar broadcast, which
@@ -140,8 +215,50 @@ impl PirClient {
     /// nothing rather than failing.
     pub fn lookup_address(&mut self, address: &[u8]) -> Result<Option<Lookup>, String> {
         let cuckoo = &self.manifest.cuckoo;
+        if cuckoo.key_derivation == KeyDerivation::Storage {
+            return Err("this server holds contract storage, not accounts".into());
+        }
         let key = cuckoo.key_derivation.key(address, cuckoo.key_size);
         self.lookup(&key)
+    }
+
+    /// Look up a storage slot of `contract`. Only a storage table answers, and
+    /// only for the contracts its manifest names: a slot of any other contract
+    /// is simply not in the table and would read as empty, so asking for one
+    /// is an error rather than a zero.
+    pub fn lookup_storage(
+        &mut self,
+        contract: &[u8; 20],
+        slot: &[u8; 32],
+    ) -> Result<Option<Lookup>, String> {
+        let cuckoo = &self.manifest.cuckoo;
+        if cuckoo.key_derivation != KeyDerivation::Storage {
+            return Err("this server holds accounts, not contract storage".into());
+        }
+        let listed = format!("0x{}", hex::encode(contract));
+        if !cuckoo.contracts.iter().any(|c| c.eq_ignore_ascii_case(&listed)) {
+            return Err(format!("this server does not hold the storage of {listed}"));
+        }
+        let key = storage_key(contract, slot, cuckoo.key_size);
+        self.lookup(&key)
+    }
+
+    /// `token.balanceOf(holder)`, read privately out of a storage table.
+    pub fn token_balance(&mut self, token: &Token, holder: &[u8; 20]) -> Result<TokenBalance, String> {
+        let slot = mapping_slot(holder, token.balances_slot);
+        match self.lookup_storage(&token.contract(), &slot)? {
+            Some(l) => {
+                let word = parse_storage_value(&l.value).ok_or("not a storage value")?;
+                Ok(TokenBalance {
+                    balance: token.balance_from_word(word),
+                    source: Some(l.source),
+                })
+            }
+            None => Ok(TokenBalance {
+                balance: [0u8; 32],
+                source: None,
+            }),
+        }
     }
 
     pub fn lookup(&mut self, key: &[u8]) -> Result<Option<Lookup>, String> {
@@ -265,4 +382,30 @@ enum LookupOutcome {
     /// The stamp's config fingerprint differs from the manifest's: the
     /// service was reconfigured (never a mere flip).
     Reconfigured,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_addresses_parse() {
+        for token in TOKENS {
+            assert_eq!(format!("0x{}", hex::encode(token.contract())), token.address);
+        }
+    }
+
+    /// USDC's blacklist bit is not part of the balance, and nobody else's top
+    /// bit is touched.
+    #[test]
+    fn only_a_flagged_top_bit_is_dropped() {
+        let mut word = [0u8; 32];
+        word[0] = 0x80;
+        word[31] = 5;
+        let usdc = TOKENS.iter().find(|t| t.symbol == "USDC").unwrap();
+        let usdt = TOKENS.iter().find(|t| t.symbol == "USDT").unwrap();
+        assert_eq!(usdc.balance_from_word(word)[0], 0);
+        assert_eq!(usdc.balance_from_word(word)[31], 5);
+        assert_eq!(usdt.balance_from_word(word), word);
+    }
 }

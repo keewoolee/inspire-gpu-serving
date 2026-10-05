@@ -4,9 +4,10 @@
 //!   pir-client --server http://host:8080 synthetic 12345
 //!   pir-client --server http://host:8080 canary
 //!   pir-client --server http://host:8080 manifest
+//!   pir-client --server http://host:8081 tokens 0xHOLDER   (a storage server)
 
 use clap::{Parser, Subcommand};
-use pir_client::{parse_account_value, PirClient, Source};
+use pir_client::{parse_account_value, PirClient, Source, TOKENS};
 use pir_keyword::cuckoo::address_from_index;
 use std::time::Instant;
 
@@ -31,6 +32,9 @@ enum Cmd {
     Canary,
     /// Print the current generation manifest.
     Manifest,
+    /// Look up an address's balances of every token a storage server holds
+    /// (USDC, USDT, DAI, WETH), always all of them.
+    Tokens { holder: String },
 }
 
 fn main() {
@@ -56,16 +60,28 @@ fn main() {
             }
         }
         Cmd::Lookup { address } => {
-            let hexpart = address.strip_prefix("0x").unwrap_or(&address);
-            let key = hex::decode(hexpart).unwrap_or_else(|e| {
-                eprintln!("bad address hex: {}", e);
-                std::process::exit(1);
-            });
-            if key.len() != 20 {
-                eprintln!("an address is 20 bytes, got {}", key.len());
-                std::process::exit(1);
-            }
+            let key = parse_address(&address);
             run_lookup(&mut client, &key);
+        }
+        Cmd::Tokens { holder } => {
+            let holder = parse_address(&holder);
+            for token in TOKENS {
+                let t0 = Instant::now();
+                let found = client.token_balance(&token, &holder).unwrap_or_else(die);
+                let ms = t0.elapsed().as_secs_f64() * 1e3;
+                let source = match found.source {
+                    Some(Source::Snapshot { block }) => format!("PIR (snapshot block #{block})"),
+                    Some(Source::Sidecar { block }) => format!("sidecar (block #{block})"),
+                    None => format!("empty slot (snapshot block #{})", client.last_snapshot_block),
+                };
+                println!(
+                    "{:<5} {:>28}  {}, {:.0} ms",
+                    token.symbol,
+                    format_units(&found.balance, token.decimals),
+                    source,
+                    ms
+                );
+            }
         }
         Cmd::Synthetic { index } => {
             let key = address_from_index(index);
@@ -101,6 +117,33 @@ fn run_lookup(client: &mut PirClient, address: &[u8]) {
                 t0.elapsed().as_secs_f64() * 1e3
             );
         }
+    }
+}
+
+fn parse_address(s: &str) -> [u8; 20] {
+    let bytes = hex::decode(s.strip_prefix("0x").unwrap_or(s)).unwrap_or_else(|e| {
+        eprintln!("bad address hex: {}", e);
+        std::process::exit(1);
+    });
+    bytes.try_into().unwrap_or_else(|b: Vec<u8>| {
+        eprintln!("an address is 20 bytes, got {}", b.len());
+        std::process::exit(1);
+    })
+}
+
+/// A big-endian amount in whole units, e.g. 1500000 at 6 decimals is "1.5".
+fn format_units(amount: &[u8; 32], decimals: u32) -> String {
+    if amount[..16].iter().any(|&b| b != 0) {
+        return format!("0x{}", hex::encode(amount));
+    }
+    let raw = u128::from_be_bytes(amount[16..].try_into().unwrap());
+    let unit = 10u128.pow(decimals);
+    let fraction = format!("{:0width$}", raw % unit, width = decimals as usize);
+    let fraction = fraction.trim_end_matches('0');
+    if fraction.is_empty() {
+        format!("{}", raw / unit)
+    } else {
+        format!("{}.{}", raw / unit, fraction)
     }
 }
 
