@@ -1,6 +1,7 @@
 //! The serving binary: load a snapshot (accounts or contract storage, from
-//! CSV) or synthetic accounts, build the first generation, and serve the HTTP
-//! API. With --eth-rpc it also follows
+//! CSV), build a table of primary names by asking the node, or make synthetic
+//! accounts; build the first generation, and serve the HTTP API. With
+//! --eth-rpc it also follows
 //! the chain (sidecar + periodic generation flips); without it, it serves the
 //! snapshot statically.
 
@@ -9,6 +10,7 @@ use pir_keyword::cuckoo::{CuckooParams, CuckooTable, DETERMINISTIC_SEED};
 use pir_server::follower::{self, Checkpoint, Feed, FollowerConfig, SimulatorConfig, TRACE_WINDOW};
 use pir_server::generation::{GenerationBuilder, ServingState};
 use pir_server::http::serve;
+use pir_server::names::{read_candidates, NamesTracker, TrackerConfig};
 use pir_server::sidecar::Sidecar;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -38,6 +40,38 @@ struct Args {
     /// Serve N synthetic accounts instead of a snapshot.
     #[clap(long)]
     synthetic: Option<usize>,
+
+    /// Serve primary names instead (ENS, GNS and WNS, keyed by address),
+    /// built at startup by asking the node. This is the starting set of
+    /// addresses for ENS: storage snapshots of the name contracts, as
+    /// `ethrex-statedump --storage-of` writes them, whose address-like values
+    /// are taken, or plain lists of addresses. Repeatable. Needs --eth-rpc.
+    #[clap(long, conflicts_with_all = ["accounts_csv", "storage_csv", "synthetic", "simulate"], requires = "eth_rpc")]
+    names_ens_candidates: Vec<String>,
+
+    /// With --names-ens-candidates: the starting set for GNS and WNS, from a
+    /// storage snapshot of those two contracts. Repeatable.
+    #[clap(long, requires = "names_ens_candidates")]
+    names_ns_candidates: Vec<String>,
+
+    /// How often to ask the gateways again for ENS names that live behind one.
+    #[clap(long, default_value_t = 3600)]
+    names_offchain_poll_secs: u64,
+
+    /// With --names-ens-candidates: save the name tracker's state to this
+    /// file, and start from it when it exists and the node can still trace
+    /// the block after it. Otherwise the table is built from the starting set.
+    #[clap(long, requires = "names_ens_candidates")]
+    names_state: Option<String>,
+
+    /// How often to save the name tracker's state, in seconds.
+    #[clap(long, default_value_t = 600)]
+    names_state_secs: u64,
+
+    /// Batches of node calls the name tracker keeps in flight at once, and
+    /// gateway lookups it makes at once.
+    #[clap(long, default_value_t = 8)]
+    names_concurrency: usize,
 
     /// Cuckoo bucket count = PIR entry count (120 B/bucket: 2^23 = 1 GB).
     /// Must be a multiple of db-rows.
@@ -131,8 +165,114 @@ fn main() {
             table.build_accounts_parallel(n);
             snapshot_block = 0;
         }
+        (None, None, None) if !args.names_ens_candidates.is_empty() => {
+            let url = args.eth_rpc.as_deref().unwrap();
+            let load = |paths: &[String], strict: bool| -> Vec<[u8; 20]> {
+                let mut all = Vec::new();
+                for path in paths {
+                    all.extend(read_candidates(Path::new(path), strict).unwrap_or_else(|e| {
+                        eprintln!("error: cannot read {}: {}", path, e);
+                        std::process::exit(2);
+                    }));
+                }
+                all.sort();
+                all.dedup();
+                all
+            };
+            let rpc = pir_chain::rpc::EthRpc::new(url);
+            let head = rpc.block_number().unwrap_or_else(|e| {
+                eprintln!("error: cannot reach {}: {}", url, e);
+                std::process::exit(1);
+            });
+            let state = args.names_state.as_ref().map(PathBuf::from);
+            let cfg = || TrackerConfig {
+                offchain_poll: Duration::from_secs(args.names_offchain_poll_secs),
+                concurrency: args.names_concurrency,
+                state: state.clone().map(|p| (p, Duration::from_secs(args.names_state_secs))),
+            };
+            // A saved state is only worth loading if the node can still trace
+            // the block after it, with some room for the load itself.
+            let resumable = state.as_ref().filter(|p| p.exists()).and_then(|p| {
+                match NamesTracker::saved_block(p) {
+                    Ok(block) if head.saturating_sub(block + 1) + 16 < TRACE_WINDOW => Some(p.clone()),
+                    Ok(block) => {
+                        eprintln!(
+                            "Names: {} is at block #{}, {} blocks behind, past what the node can trace; \
+                             building from the starting set",
+                            p.display(),
+                            block,
+                            head - block
+                        );
+                        None
+                    }
+                    Err(e) => {
+                        eprintln!("Names: cannot read {}: {}; building from the starting set", p.display(), e);
+                        None
+                    }
+                }
+            });
+            let mut tracker = match resumable {
+                Some(p) => {
+                    let t0 = Instant::now();
+                    let t = NamesTracker::load(&p, url, cfg()).unwrap_or_else(|e| {
+                        eprintln!("error: cannot load {}: {}", p.display(), e);
+                        std::process::exit(1);
+                    });
+                    eprintln!("Names: resumed from {} in {:.1}s; {}", p.display(), t0.elapsed().as_secs_f64(), t.summary());
+                    t
+                }
+                None => {
+                    let ens = load(&args.names_ens_candidates, true);
+                    let ns = load(&args.names_ns_candidates, false);
+                    eprintln!(
+                        "Names: asking about {} ENS and {} GNS/WNS starting addresses, following from block #{}",
+                        ens.len(),
+                        ns.len(),
+                        head
+                    );
+                    NamesTracker::new(url, head, ens, ns, cfg())
+                }
+            };
+            for (address, names) in tracker.named() {
+                let key = table.params.key_derivation.key(address, table.params.key_size);
+                table.upsert(&key, &names.pack());
+            }
+            table.params.content = "names".into();
+            let started = Instant::now();
+            while !tracker.starting_set_done() {
+                match tracker.step() {
+                    Ok(changes) => {
+                        for c in changes {
+                            let key = table.params.key_derivation.key(&c.address, table.params.key_size);
+                            table.upsert(&key, &c.value);
+                        }
+                    }
+                    Err(e) => {
+                        let behind = rpc.block_number().map(|h| h.saturating_sub(tracker.synced_to + 1));
+                        if matches!(behind, Ok(b) if b >= TRACE_WINDOW) {
+                            eprintln!("error: fell out of the node's trace window ({}); start over", e);
+                            std::process::exit(1);
+                        }
+                        eprintln!("names step failed: {} (retrying in 5s)", e);
+                        std::thread::sleep(Duration::from_secs(5));
+                    }
+                }
+            }
+            eprintln!(
+                "Names: starting set asked in {:.0}s; {}",
+                started.elapsed().as_secs_f64(),
+                tracker.summary()
+            );
+            if let Some(p) = &state {
+                tracker.save_now(p);
+            }
+            snapshot_block = tracker.synced_to;
+            feed = Feed::Names(Box::new(tracker));
+        }
         (None, None, None) => {
-            eprintln!("error: pass --accounts-csv, --storage-csv or --synthetic N");
+            eprintln!(
+                "error: pass --accounts-csv, --storage-csv, --names-ens-candidates or --synthetic N"
+            );
             std::process::exit(2);
         }
     }

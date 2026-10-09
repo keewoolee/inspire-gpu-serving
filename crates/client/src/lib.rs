@@ -27,6 +27,7 @@
 use pir_backend_ffi::{pack_query, ClientQuery, Params};
 use pir_keyword::cuckoo::{CuckooHash, CANARY_ADDRESS};
 use pir_keyword::manifest::{KeyDerivation, Manifest, SidecarBroadcast};
+use pir_keyword::names::Names;
 use pir_keyword::slots::unpack_bytes;
 use pir_keyword::storage::{mapping_slot, parse_storage_value, storage_key};
 
@@ -137,6 +138,15 @@ pub struct TokenBalance {
     pub source: Option<Source>,
 }
 
+/// An address's primary names and where they came from. No source means the
+/// table proved it holds nothing for the address, which is no name in any
+/// system.
+#[derive(Clone, Debug)]
+pub struct NamesLookup {
+    pub names: Names,
+    pub source: Option<Source>,
+}
+
 /// Cap on a response body. A lookup carries the whole sidecar broadcast, which
 /// grows with every block until the next generation flip folds it in, so the
 /// 10 MiB default trips exactly when a server is catching up.
@@ -218,8 +228,31 @@ impl PirClient {
         if cuckoo.key_derivation == KeyDerivation::Storage {
             return Err("this server holds contract storage, not accounts".into());
         }
+        if !cuckoo.content.is_empty() {
+            return Err(format!("this server holds {}, not accounts", cuckoo.content));
+        }
         let key = cuckoo.key_derivation.key(address, cuckoo.key_size);
         self.lookup(&key)
+    }
+
+    /// An address's ENS, GNS and WNS primary names, from a name table, in one
+    /// lookup whatever the address holds.
+    pub fn names(&mut self, address: &[u8; 20]) -> Result<NamesLookup, String> {
+        let cuckoo = &self.manifest.cuckoo;
+        if cuckoo.content != "names" {
+            return Err("this server does not hold primary names".into());
+        }
+        let key = cuckoo.key_derivation.key(address, cuckoo.key_size);
+        match self.lookup(&key)? {
+            Some(l) => Ok(NamesLookup {
+                names: Names::unpack(&l.value)?,
+                source: Some(l.source),
+            }),
+            None => Ok(NamesLookup {
+                names: Names::default(),
+                source: None,
+            }),
+        }
     }
 
     /// Look up a storage slot of `contract`. Only a storage table answers, and

@@ -110,6 +110,9 @@ pub struct CuckooParams {
     /// For a storage table, the contracts whose slots it holds. Also set from
     /// the snapshot, and published alongside the key derivation.
     pub contracts: Vec<[u8; 20]>,
+    /// What the values mean when the key does not say, published in the
+    /// manifest: `names` for a table of primary names. Empty otherwise.
+    pub content: String,
 }
 
 impl CuckooParams {
@@ -124,6 +127,7 @@ impl CuckooParams {
             seed,
             key_derivation: KeyDerivation::Address,
             contracts: Vec::new(),
+            content: String::new(),
         }
     }
 

@@ -5,10 +5,12 @@
 //!   pir-client --server http://host:8080 canary
 //!   pir-client --server http://host:8080 manifest
 //!   pir-client --server http://host:8081 tokens 0xHOLDER   (a storage server)
+//!   pir-client --server http://host:8092 names 0xADDRESS   (a name server)
 
 use clap::{Parser, Subcommand};
 use pir_client::{parse_account_value, PirClient, Source, TOKENS};
 use pir_keyword::cuckoo::address_from_index;
+use pir_keyword::names::{NameEntry, NameSystem};
 use std::time::Instant;
 
 #[derive(Parser)]
@@ -35,6 +37,8 @@ enum Cmd {
     /// Look up an address's balances of every token a storage server holds
     /// (USDC, USDT, DAI, WETH), always all of them.
     Tokens { holder: String },
+    /// Look up an address's ENS, GNS and WNS primary names (a name server).
+    Names { address: String },
 }
 
 fn main() {
@@ -81,6 +85,28 @@ fn main() {
                     source,
                     ms
                 );
+            }
+        }
+        Cmd::Names { address } => {
+            let address = parse_address(&address);
+            let t0 = Instant::now();
+            let found = client.names(&address).unwrap_or_else(die);
+            let ms = t0.elapsed().as_secs_f64() * 1e3;
+            for system in NameSystem::ALL {
+                let shown = match found.names.get(system) {
+                    Some(NameEntry::Name(n)) => n.clone(),
+                    Some(NameEntry::TooLong) => "(a name too long for the table)".into(),
+                    None => "-".into(),
+                };
+                println!("{:<4} {}", system.label(), shown);
+            }
+            match found.source {
+                Some(Source::Snapshot { block }) => println!("source: PIR (snapshot block #{block}), {ms:.0} ms"),
+                Some(Source::Sidecar { block }) => println!("source: sidecar (block #{block}), {ms:.0} ms"),
+                None => println!(
+                    "source: no entry (proven at snapshot block #{}), {ms:.0} ms",
+                    client.last_snapshot_block
+                ),
             }
         }
         Cmd::Synthetic { index } => {

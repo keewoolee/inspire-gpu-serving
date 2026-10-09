@@ -43,6 +43,17 @@ pub struct StorageUpdate {
     pub value: [u8; 32],
 }
 
+/// What one transaction changed, from its prestate diff.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TxDiff {
+    /// Every account the transaction changed, its sender included.
+    pub accounts: Vec<[u8; 20]>,
+    /// Every storage slot it changed, with the value it left there.
+    pub storage: Vec<StorageUpdate>,
+    /// The accounts whose code it changed.
+    pub code: Vec<[u8; 20]>,
+}
+
 impl EthRpc {
     pub fn new(url: &str) -> Self {
         let agent = ureq::Agent::new_with_defaults();
@@ -256,6 +267,74 @@ impl EthRpc {
         let result = self.call("debug_traceBlockByNumber", json!([block_hex, config]))?;
         let traces = result.as_array().ok_or("trace result is not an array")?;
         storage_updates_from_prestate_diff(traces, contracts)
+    }
+
+    /// Fetch what each transaction of a block changed, from the same state
+    /// diff, kept apart per transaction so a caller can tell which accounts a
+    /// change came with. No fallback, as for storage.
+    pub fn fetch_block_tx_diffs(&self, block_num: u64) -> Result<Vec<TxDiff>, String> {
+        let block_hex = format!("0x{:x}", block_num);
+        let config = json!({"tracer": "prestateTracer", "tracerConfig": {"diffMode": true}});
+        let result = self.call("debug_traceBlockByNumber", json!([block_hex, config]))?;
+        let traces = result.as_array().ok_or("trace result is not an array")?;
+        tx_diffs_from_prestate(traces)
+    }
+
+    /// Logs of one block emitted by `address` with first topic `topic0`.
+    pub fn get_logs(&self, block_num: u64, address: &str, topic0: &str) -> Result<Vec<Value>, String> {
+        let block_hex = format!("0x{:x}", block_num);
+        let filter = json!({
+            "fromBlock": block_hex,
+            "toBlock": block_hex,
+            "address": address,
+            "topics": [topic0],
+        });
+        let result = self.call("eth_getLogs", json!([filter]))?;
+        result
+            .as_array()
+            .cloned()
+            .ok_or_else(|| "logs result is not an array".into())
+    }
+
+    /// A batch call that keeps each item's error, unlike `batch_call`, since a
+    /// reverted `eth_call` carries its answer in the error's data. Items come
+    /// back in request order.
+    pub fn batch_raw(&self, requests: &[(&str, Value)]) -> Result<Vec<Result<Value, Value>>, String> {
+        if requests.is_empty() {
+            return Ok(vec![]);
+        }
+        let batch: Vec<Value> = requests
+            .iter()
+            .enumerate()
+            .map(|(i, (method, params))| {
+                json!({"jsonrpc": "2.0", "method": method, "params": params, "id": i})
+            })
+            .collect();
+        let resp = self
+            .agent
+            .post(&self.url)
+            .header("Content-Type", "application/json")
+            .send_json(&batch)
+            .map_err(|e| format!("batch RPC failed: {}", e))?;
+        let mut body = resp.into_body();
+        let json: Value = body
+            .with_config()
+            .limit(MAX_RESPONSE_BYTES)
+            .read_json()
+            .map_err(|e| format!("batch parse failed: {}", e))?;
+        let arr = json.as_array().ok_or("batch response not array")?;
+        let mut out: Vec<Option<Result<Value, Value>>> = vec![None; requests.len()];
+        for item in arr {
+            let id = item["id"].as_u64().ok_or("batch item without id")? as usize;
+            let slot = out.get_mut(id).ok_or("batch item with an unknown id")?;
+            *slot = Some(match item.get("error") {
+                Some(err) => Err(err.clone()),
+                None => Ok(item.get("result").cloned().unwrap_or(Value::Null)),
+            });
+        }
+        out.into_iter()
+            .map(|r| r.ok_or_else(|| "batch response missing an item".to_string()))
+            .collect()
     }
 
     /// Fetch a block and return all account state changes.
@@ -731,6 +810,57 @@ fn storage_updates_from_prestate_diff(
         .collect())
 }
 
+/// Split a block's prestate diffs into what each transaction changed. Storage
+/// follows the same rule as `storage_updates_from_prestate_diff`: a slot in
+/// `pre` but not in `post` went to zero.
+fn tx_diffs_from_prestate(traces: &[Value]) -> Result<Vec<TxDiff>, String> {
+    let mut out = Vec::with_capacity(traces.len());
+    for trace in traces {
+        let inner = trace.get("result").unwrap_or(trace);
+        let pre = inner.get("pre").and_then(|v| v.as_object());
+        let post = inner.get("post").and_then(|v| v.as_object());
+        let mut addresses: Vec<&String> = pre.into_iter().flat_map(|p| p.keys()).collect();
+        addresses.extend(post.into_iter().flat_map(|p| p.keys()));
+        addresses.sort();
+        addresses.dedup();
+
+        let mut diff = TxDiff::default();
+        for address_hex in addresses {
+            let Some(address) = parse_hex_address(address_hex) else { continue };
+            let address: [u8; 20] = address.try_into().unwrap();
+            diff.accounts.push(address);
+            let pre_account = pre.and_then(|p| p.get(address_hex));
+            let post_account = post.and_then(|p| p.get(address_hex));
+            let storage_of = |account: Option<&Value>| {
+                account
+                    .and_then(|account| account.get("storage"))
+                    .and_then(|storage| storage.as_object())
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            let before = storage_of(pre_account);
+            let after = storage_of(post_account);
+            for (slot_hex, value) in &after {
+                let slot = parse_hex_word(slot_hex).ok_or(format!("bad slot {slot_hex}"))?;
+                let value = value
+                    .as_str()
+                    .and_then(parse_hex_word)
+                    .ok_or(format!("bad value for slot {slot_hex}"))?;
+                diff.storage.push(StorageUpdate { contract: address, slot, value });
+            }
+            for slot_hex in before.keys().filter(|slot| !after.contains_key(*slot)) {
+                let slot = parse_hex_word(slot_hex).ok_or(format!("bad slot {slot_hex}"))?;
+                diff.storage.push(StorageUpdate { contract: address, slot, value: [0u8; 32] });
+            }
+            if post_account.and_then(|account| account.get("code")).is_some() {
+                diff.code.push(address);
+            }
+        }
+        out.push(diff);
+    }
+    Ok(out)
+}
+
 /// A 32-byte word from hex, right-aligned, as storage slots and their values
 /// arrive (usually padded to 64 digits, but minimal hex is read too).
 fn parse_hex_word(s: &str) -> Option<[u8; 32]> {
@@ -995,5 +1125,32 @@ mod tests {
             "post": { USDT: { "storage": { "0x01": "0xnot-hex" } } }
         }})];
         assert!(storage_updates_from_prestate_diff(&traces, &[usdt()]).is_err());
+    }
+
+    /// Per-transaction diffs keep each transaction's accounts, slots and code
+    /// changes apart, and a slot left out of `post` went to zero.
+    #[test]
+    fn tx_diffs_keep_transactions_apart() {
+        let traces = vec![
+            json!({"txHash": "0x01", "result": {
+                "pre": { A: { "nonce": 1 }, USDT: { "storage": { "0x01": "0x05" } } },
+                "post": { A: { "nonce": 2 }, USDT: { "storage": { "0x02": "0x07" } } }
+            }}),
+            json!({"txHash": "0x02", "result": {
+                "pre": { B: { "balance": "0x1" } },
+                "post": { B: { "balance": "0x0" }, C: { "code": "0x6001" } }
+            }}),
+        ];
+        let diffs = tx_diffs_from_prestate(&traces).unwrap();
+        assert_eq!(diffs.len(), 2);
+        let addr = |s: &str| -> [u8; 20] { parse_hex_address(s).unwrap().try_into().unwrap() };
+        assert_eq!(diffs[0].accounts, vec![addr(A), usdt()]);
+        let mut slots: Vec<_> = diffs[0].storage.iter().map(|u| (u.slot, u.value)).collect();
+        slots.sort();
+        assert_eq!(slots, vec![(word("0x01"), [0u8; 32]), (word("0x02"), word("0x07"))]);
+        assert!(diffs[0].code.is_empty());
+        assert_eq!(diffs[1].accounts, vec![addr(B), addr(C)]);
+        assert!(diffs[1].storage.is_empty());
+        assert_eq!(diffs[1].code, vec![addr(C)]);
     }
 }

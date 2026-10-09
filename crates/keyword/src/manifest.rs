@@ -74,6 +74,12 @@ pub struct CuckooManifest {
     /// Empty, and left out of the JSON, for an account table.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub contracts: Vec<String>,
+    /// What the values mean, when the key alone does not say: `names` for a
+    /// table of primary names keyed by address, which would otherwise look
+    /// like an address-keyed account table. Empty, and left out of the JSON,
+    /// for account and storage tables.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub content: String,
 }
 
 impl CuckooManifest {
@@ -191,10 +197,10 @@ impl Manifest {
     /// the CRS is public, and the two can even take queries and answers of the
     /// same size. So its fingerprint also covers the contracts it holds, and a
     /// client sent to the wrong table notices instead of reading every slot as
-    /// empty.
+    /// empty. A name table's covers its content tag, for the same reason.
     pub fn config_fp(&self) -> String {
         let seed = &self.pir.crs_seed_hex;
-        if self.cuckoo.contracts.is_empty() {
+        if self.cuckoo.contracts.is_empty() && self.cuckoo.content.is_empty() {
             return seed[..16.min(seed.len())].to_string();
         }
         use sha3::Digest;
@@ -203,6 +209,10 @@ impl Manifest {
         for contract in &self.cuckoo.contracts {
             hasher.update(b",");
             hasher.update(contract.to_ascii_lowercase().as_bytes());
+        }
+        if !self.cuckoo.content.is_empty() {
+            hasher.update(b";");
+            hasher.update(self.cuckoo.content.as_bytes());
         }
         hex::encode(&hasher.finalize()[..8])
     }
@@ -236,6 +246,7 @@ mod tests {
                 seed_hex: hex::encode(DETERMINISTIC_SEED),
                 key_derivation: KeyDerivation::Address,
                 contracts: vec![],
+                content: String::new(),
             },
             pir: PirManifest {
                 n_entries: 1 << 27,
@@ -271,6 +282,14 @@ mod tests {
         assert_eq!(lower.config_fp(), tokens.config_fp());
         lower.cuckoo.contracts.push("0xdac17f958d2ee523a2206206994597c13d831ec7".into());
         assert_ne!(lower.config_fp(), tokens.config_fp());
+
+        // A name table is keyed by address like an old account table, so only
+        // its content tag tells the two apart.
+        let mut names = m2.clone();
+        names.cuckoo.content = "names".into();
+        assert_ne!(names.config_fp(), m2.config_fp());
+        assert!(names.to_json().contains("\"content\": \"names\""));
+        assert!(!m2.to_json().contains("content"));
     }
 
     #[test]
@@ -330,6 +349,7 @@ mod tests {
             seed_hex: "00".into(),
             key_derivation: KeyDerivation::Keccak,
             contracts: vec![],
+            content: String::new(),
         };
         assert!(!serde_json::to_string(&c).unwrap().contains("contracts"));
         c.key_derivation = KeyDerivation::Storage;

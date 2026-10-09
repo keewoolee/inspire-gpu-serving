@@ -13,8 +13,11 @@
 //!   setup) and the sidecar-broadcast wire types.
 //! - [`storage`]: keys and values for a table of contract storage slots,
 //!   such as the ones holding token balances.
+//! - [`names`]: the value a name table holds for an address, its ENS, GNS
+//!   and WNS primary names.
 
 pub mod cuckoo;
 pub mod manifest;
+pub mod names;
 pub mod slots;
 pub mod storage;

@@ -211,6 +211,7 @@ impl GenerationBuilder {
                     .iter()
                     .map(|c| format!("0x{}", hex::encode(c)))
                     .collect(),
+                content: self.table.params.content.clone(),
             },
             pir: srv.params().to_manifest(),
         };
