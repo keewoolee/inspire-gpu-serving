@@ -16,8 +16,8 @@ no downtime.
     that arrived since, so serving stays current between the periodic
     re-preprocesses.
 - **Deployment target.** Private Ethereum state retrieval (a wallet
-  privately reading an account's balance and nonce, or its balance of a
-  token); the Ethereum side
+  privately reading an account's balance and nonce, its balance of a
+  token, or its primary name); the Ethereum side
   is confined to `crates/chain` (a JSON-RPC chain follower) plus a chain
   simulator for demos. Any other key-value source slots in by supplying the same two
   things: an initial key-value set, and a stream of updates.
@@ -169,6 +169,13 @@ What has actually been demonstrated, beyond the numbers above:
   matched `balanceOf` on the node at the block that answered it. A restart
   from the server's own save resumed at the next block, and 96 more
   balances checked after it all matched.
+- **Primary names, live beside the accounts and tokens on the same H100.**
+  Asking the node about 1.45M starting addresses took 20 minutes with eight
+  batches in flight and found 913,983 addresses with a name (ENS 913,841,
+  GNS 151, WNS 162), in a 2^20-bucket table at 44% load and 0.23 GB of VRAM.
+  A sample of 53 lookups matched the chain, and so did all 110 changes the
+  server followed live over 10 minutes, checked from another IP. A restart
+  from the saved state serves again within 10 seconds.
 - **The live-chain path works end to end.** Against a key-less public
   endpoint, the server snapshotted the mainnet head, ingested live
   blocks, flipped, and returned the fresh balance/nonce of an account
@@ -232,12 +239,12 @@ the next flip.
 
 | Crate | Contents |
 |---|---|
-| [`crates/keyword`](crates/keyword) | Cuckoo hashing with capacity-2 buckets; 15-bit byte↔slot packing; the row-major slot matrix the engine ingests; the manifest and sidecar-broadcast wire types; keys and values for contract storage slots. |
+| [`crates/keyword`](crates/keyword) | Cuckoo hashing with capacity-2 buckets; 15-bit byte↔slot packing; the row-major slot matrix the engine ingests; the manifest and sidecar-broadcast wire types; keys and values for contract storage slots; the value a name table holds. |
 | [`crates/backend-ffi`](crates/backend-ffi) | Safe Rust bindings over the `ipir_*` C ABI. The client half builds anywhere (compiles the engine's CPU sources directly — no CMake, no CUDA); the server half (`gpu` feature) links the static libraries, running the CMake build itself when needed. |
-| [`crates/server`](crates/server) | The serving front: batch scheduler owning the GPU handle, generation builder + flips, sidecar store, chain source (`--eth-rpc` follower or `--simulate` simulator), HTTP API (`/manifest`, `/lookup`, `/sidecar`, `/query`, `/healthz` — wire contract documented in [`src/http.rs`](crates/server/src/http.rs)). |
-| [`crates/client`](crates/client) | Client library + CLI, the reference for wallet integration: single-round fixed-shape lookups of accounts and token balances, local answer picking, reconfiguration detection. No GPU. |
+| [`crates/server`](crates/server) | The serving front: batch scheduler owning the GPU handle, generation builder + flips, sidecar store, chain source (`--eth-rpc` follower or `--simulate` simulator), the tracker that keeps a table of primary names current, HTTP API (`/manifest`, `/lookup`, `/sidecar`, `/query`, `/healthz` — wire contract documented in [`src/http.rs`](crates/server/src/http.rs)). |
+| [`crates/client`](crates/client) | Client library + CLI, the reference for wallet integration: single-round fixed-shape lookups of accounts, token balances and primary names, local answer picking, reconfiguration detection. No GPU. |
 | [`crates/front`](crates/front) | Thin switchable forwarder for the cross-machine role swap (`POST /admin/target`; no auth — keep it inside the deployment boundary). |
-| [`crates/chain`](crates/chain) | Ethereum JSON-RPC adapter: block tracking, state-diff and touched-address extraction, batched balance/nonce fetch, snapshot resync. Also `ethrex-statedump` (feature `ethrex-dump`), which writes an ethrex node's account table, or the storage of chosen contracts, as a snapshot CSV stamped at the chain head. |
+| [`crates/chain`](crates/chain) | Ethereum JSON-RPC adapter: block tracking, state-diff and touched-address extraction, batched balance/nonce fetch, snapshot resync, and primary names (the calls a wallet makes, what they read, CCIP-Read). Also `ethrex-statedump` (feature `ethrex-dump`), which writes an ethrex node's account table, or the storage of chosen contracts, as a snapshot CSV stamped at the chain head. |
 
 ## Build & run
 
@@ -417,3 +424,131 @@ keeps a recent save to restart from. A longer outage needs a fresh dump.
 The storage table can share the account table's `--crs-seed`, since the CRS
 is public. Its response stamp also covers the contracts it holds, so a client
 sent to the wrong table still notices.
+
+## Primary names
+
+The server can also serve an address's primary names in ENS, GNS and WNS,
+the names a wallet shows for its own accounts. One lookup answers all three.
+Such a table runs in a server process of its own, started with
+`--names-ens-candidates`, and its manifest says `"content": "names"`. It is
+keyed by the address itself:
+
+```
+key    (20 B)  =   the address
+value  (40 B)  =   [system (1 B)][length (1 B)][UTF-8 name]  for each system with a name,
+                   in the order ENS (1), GNS (2), WNS (3), then zeros
+```
+
+A system byte with its top bit set (`0x81`, `0x82`, `0x83`) and length 0 means
+that system has a name too long for the value, about 0.26% of named
+addresses. An address with no name in any system holds all zeros or is not in
+the table, and both read as no name.
+
+Each answer is what a wallet would have fetched itself:
+
+| System | The call behind the answer | Contract |
+|---|---|---|
+| ENS | `reverseWithGateways(address, 60, ["x-batch-gateway:true"])` | Universal Resolver `0xeeeeeeee14d718c2b47d9923deab1335e144eeee` |
+| GNS | `reverseResolve(address)` | `0x9D51D507BC7264d4fE8Ad1cf7Fe191933A0a81d6` |
+| WNS | `reverseResolve(address)` | `0x0000000000696760E15f265e828DB644A0c242EB` |
+
+The ENS call is the one viem's `getEnsName` makes, gateways included, so the
+name is checked both ways: the address's reverse record names it, and the
+name's forward record points back at the address. GNS and WNS check the same
+inside `reverseResolve`.
+
+From code, or from the command line:
+
+```rust
+let mut client = PirClient::connect("http://HOST:8092")?;
+let found = client.names(&address)?;   // found.names.ens, .gns, .wns
+```
+
+```bash
+cargo run --release -p pir-client -- --server http://HOST:8092 \
+    names 0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045
+```
+
+### In a middleware
+
+A wallet library asks for names through several `eth_call`s, and every one
+of them carries the address or a name that identifies it just as well.
+ethereum-names, which kohaku-cli uses, asks GNS, ENS and WNS in turn, and
+checks each name it gets with a forward lookup. A middleware answers all of
+these from one names lookup per address, the forward checks included:
+
+| `eth_call` | Selector | Answer |
+|---|---|---|
+| `reverseWithGateways(bytes addr, uint256 coinType, string[] gateways)` on the Universal Resolver, `coinType` 60 | `0xb7d6ca64` | `abi.encode(string name, address, address)`, `""` for no name. viem reads only the name, so both addresses can be 0. |
+| `resolveWithGateways(bytes dnsName, bytes data, string[] gateways)` on the Universal Resolver, where `data` is `addr(bytes32 node)` (`0x3b3b57de`) for a name the lookup returned | `0xa1472844` | `abi.encode(bytes result, address resolver)` with `result = abi.encode(address)`, the address looked up. viem ignores `resolver`. |
+| `reverseResolve(address)` on GNS or WNS | `0x9af8b7aa` | `abi.encode(string name)`, `""` for no name |
+| `computeId(string fullName)` on GNS or WNS | `0xfb021939` | the name's namehash as a `uint256`. The function is pure, so the middleware computes it: lowercase the ASCII letters, then the usual ENS namehash. |
+| `resolve(uint256 tokenId)` on GNS or WNS, for that id | `0x4f896d4f` | `abi.encode(address)`, the address looked up |
+
+- **One lookup per address, whatever was asked.** Answering every system from
+  the same lookup keeps the number of lookups from saying which systems an
+  address uses.
+- **A name too long for the table** cannot be answered from it. Pass that call
+  on to the RPC, which then sees the address, or treat it as no name.
+- **Everything else passes through as before, and still says what it asks.**
+  That covers resolving a name the user typed (a send to `vitalik.eth`), text
+  records and avatars (the stealth meta-address record among them), and
+  primary names on other chains (`coinType` other than 60).
+
+### Freshness and coverage
+
+- **On-chain changes are followed block by block.** For every address with
+  an answer, the server keeps the storage slots that answer read
+  (`eth_createAccessList`), and each block's state diff says which slots
+  changed. Only the addresses that read one are asked again, so a change
+  anywhere the answer depends on is caught, a resolver that emits no event
+  included. GNS and WNS names expire without an event, so their holders are
+  asked every block.
+- **Offchain names** (`cb.id`, `base.eth` and others whose forward record sits
+  behind a gateway) are resolved by the server through CCIP-Read, the way viem
+  does, and asked again about once an hour, paced so that no gateway sees a
+  burst. A gateway that fails keeps the last answer, and a 4xx from it reads
+  as no name, as in viem. A change made at the gateway shows up within the
+  hour.
+- **Which addresses the table knows.** It starts from every address-like value
+  in the name contracts' storage, since a primary name needs a forward record
+  pointing at the address and an on-chain one stores it there. After that,
+  every account a block changes is asked once, along with every account of a
+  transaction that writes name-contract storage and the addresses named in
+  `ReverseClaimed`, `NameForAddrChanged` and `PrimaryNameSet`. A name set long
+  ago for an address that never transacts again can be missed until it does.
+
+Serving it:
+
+```bash
+# Dump the storage of the ENS contracts that hold names and forward records
+# (registries, resolvers, reverse registrar, name wrapper, .eth registrar),
+# and of GNS and WNS, next to the node:
+ENS="0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e 0x314159265dD8dbb310642f98f50C066173C1259b
+     0x231b0Ee14048e9dCcD1d247744d114a4EB5E8E63 0x4976fb03C32e5B8cfe2b6cCB31c09Ba78EBaBa41
+     0xF29100983E058B709F3D539b0c765937B804AC15 0xDaaF96c344f63131acadD0Ea35170E7892d3dfBA
+     0x226159d592E2b063810a10Ebf6dcbADA94Ed68b8 0x5FfC014343cd971B7eb70732021E26C35B744cc4
+     0xA2C122BE93b0074270ebeE7f6b7292C7deB45047 0x5fBb459C49BB06083C33109fA4f14810eC2Cf358
+     0x283F227c4Bd38ecE252C4Ae7ECE650B0e913f1f9 0xDa1756Bb923Af5d1a05E277CB1E54f1D0A127890
+     0xB23267E7A0dEe4Dcba80c1D2fFdB0270aF76fE80 0xF58d55f06bB92F083e78bb5063A2dD3544f9B6a3
+     0xD4416b13d2b3a9aBae7AcD5D6C2BbDBE25686401 0x57f1887a8BF19b14fC0dF6Fd9B2acc9Af147eA85"
+cargo run --release -p pir-chain --features ethrex-dump \
+    --bin ethrex-statedump -- --datadir /path/to/ethrex/mainnet \
+    --out ens.csv $(for c in $ENS; do echo --storage-of $c; done)
+cargo run --release -p pir-chain --features ethrex-dump \
+    --bin ethrex-statedump -- --datadir /path/to/ethrex/mainnet \
+    --out ns.csv --storage-of 0x9D51D507BC7264d4fE8Ad1cf7Fe191933A0a81d6 \
+    --storage-of 0x0000000000696760E15f265e828DB644A0c242EB
+
+# Serve it. The server asks the node about every starting address (about 20
+# minutes on mainnet), then follows the chain, saving its state every 10 minutes:
+cargo run --release -p pir-server -- --names-ens-candidates ens.csv \
+    --names-ns-candidates ns.csv --names-state names.state \
+    --buckets 1048576 --eth-rpc http://NODE:8545 --listen 0.0.0.0:8092
+```
+
+A restart within the node's trace window loads the saved state and serves
+again in about 10 seconds. After a longer outage the server builds the table
+from the starting set again. The table can share the account table's
+`--crs-seed`, and its response stamp covers its content tag, so a client sent
+to the wrong table notices.
