@@ -46,22 +46,13 @@ pub struct Lookup {
     pub source: Source,
 }
 
-/// Balance/nonce view of a 40-byte account value
-/// ([16B zero][16B balance BE][8B nonce BE]).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct AccountValue {
-    pub balance: u128,
-    pub nonce: u64,
-}
+pub use pir_keyword::account::AccountValue;
 
+/// Balance, nonce and EIP-7702 delegate of a 40-byte account value
+/// ([20B delegate][12B balance BE][8B nonce BE]). `AccountValue::code` gives
+/// what `eth_getCode` returns for the address, provided it is an EOA.
 pub fn parse_account_value(v: &[u8]) -> Option<AccountValue> {
-    if v.len() != 40 {
-        return None;
-    }
-    Some(AccountValue {
-        balance: u128::from_be_bytes(v[16..32].try_into().unwrap()),
-        nonce: u64::from_be_bytes(v[32..40].try_into().unwrap()),
-    })
+    AccountValue::unpack(v)
 }
 
 /// An ERC-20 token whose balances a storage table can answer for: where its

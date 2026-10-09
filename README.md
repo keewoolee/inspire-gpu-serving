@@ -16,8 +16,8 @@ no downtime.
     that arrived since, so serving stays current between the periodic
     re-preprocesses.
 - **Deployment target.** Private Ethereum state retrieval (a wallet
-  privately reading an account's balance and nonce, its balance of a
-  token, or its primary name); the Ethereum side
+  privately reading an account's balance, nonce and EIP-7702 delegation,
+  its balance of a token, or its primary name); the Ethereum side
   is confined to `crates/chain` (a JSON-RPC chain follower) plus a chain
   simulator for demos. Any other key-value source slots in by supplying the same two
   things: an initial key-value set, and a stream of updates.
@@ -98,8 +98,13 @@ bucket (120 B)
 ├─ cell 0 (60 B):  key (20 B) ‖ value (40 B)
 └─ cell 1 (60 B):  key (20 B) ‖ value (40 B)
 key    (20 B)  =   address, or keccak256(address) cut to 20 B
-value  (40 B)  =   reserved (16 B) ‖ balance, BE (16 B) ‖ nonce, BE (8 B)
+value  (40 B)  =   delegate (20 B) ‖ balance, BE (12 B) ‖ nonce, BE (8 B)
 ```
+
+- **The delegate is the account's code.** Under EIP-7702 an EOA's code is
+  empty or `0xef0100 ‖ delegate`, so 20 bytes hold all of it, and all
+  zeros means none (see [Delegated code](#delegated-code-eip-7702)). Twelve
+  bytes hold any balance, since all the ether there is is below 2^87 wei.
 
 - **Cells carry their key** because a retrieved bucket can hold two
   different accounts (or fewer — empty cells are all-zero): the client
@@ -136,10 +141,11 @@ value  (40 B)  =   reserved (16 B) ‖ balance, BE (16 B) ‖ nonce, BE (8 B)
 
 What has actually been demonstrated, beyond the numbers above:
 
-- **Mainnet, live, on one H100 (80 GB).** The server serves the 206.8M
-  mainnet accounts holding ETH (out of 418.8M in a full-state dump taken
-  on 2026-09-16) from a 16 GB PIR matrix at 77% cell load, and follows the
-  chain block by block through state diffs. It holds 25.4 GiB of VRAM in
+- **Mainnet, live, on one H100 (80 GB).** The server serves the 220.5M
+  mainnet accounts that hold ETH or delegate their code (209.6M holding
+  ETH and 10.9M more delegated ones, out of 423.4M in a full-state dump
+  taken on 2026-10-09) from a 16 GB PIR matrix at 82% cell load, and
+  follows the chain block by block through state diffs. It holds 25.4 GiB of VRAM in
   steady state and peaks at 53.6 GiB during a generation flip, which
   builds the next generation beside the serving one (2.11×). The HTTP
   server sustains ~44 lookups/s with 32 concurrent clients (~10 for a
@@ -162,6 +168,14 @@ What has actually been demonstrated, beyond the numbers above:
   (`scripts/live-sim-demo.sh`). Over an accelerated simulation the
   serving snapshot advanced 0 → 9 → 18 with **no client resync**, and an
   account updated every block was always current.
+- **EIP-7702 delegations, in the account table.** A dump finds the 12.6M
+  accounts that delegate their code through the node's code table (2.8M
+  distinct code hashes, within a 5.1-minute dump). For 63 addresses taken
+  from recent blocks (43 delegated, 15 plain, 5 contracts), balance, nonce
+  and code matched the node at the block that answered, including an
+  account that switched delegates twice while the server followed it and
+  one whose delegation had been cleared, which the state diff does not
+  show.
 - **ERC-20 balances, live beside the accounts on the same H100.** The
   storage of USDC, USDT, DAI and WETH is 53.7M slots, which fill a
   2^25-bucket table to 80% and take 6.5 GB of VRAM next to the account
@@ -244,7 +258,7 @@ the next flip.
 | [`crates/server`](crates/server) | The serving front: batch scheduler owning the GPU handle, generation builder + flips, sidecar store, chain source (`--eth-rpc` follower or `--simulate` simulator), the tracker that keeps a table of primary names current, HTTP API (`/manifest`, `/lookup`, `/sidecar`, `/query`, `/healthz` — wire contract documented in [`src/http.rs`](crates/server/src/http.rs)). |
 | [`crates/client`](crates/client) | Client library + CLI, the reference for wallet integration: single-round fixed-shape lookups of accounts, token balances and primary names, local answer picking, reconfiguration detection. No GPU. |
 | [`crates/front`](crates/front) | Thin switchable forwarder for the cross-machine role swap (`POST /admin/target`; no auth — keep it inside the deployment boundary). |
-| [`crates/chain`](crates/chain) | Ethereum JSON-RPC adapter: block tracking, state-diff and touched-address extraction, batched balance/nonce fetch, snapshot resync, and primary names (the calls a wallet makes, what they read, CCIP-Read). Also `ethrex-statedump` (feature `ethrex-dump`), which writes an ethrex node's account table, or the storage of chosen contracts, as a snapshot CSV stamped at the chain head. |
+| [`crates/chain`](crates/chain) | Ethereum JSON-RPC adapter: block tracking, state-diff and touched-address extraction, batched balance/nonce/code fetch, snapshot resync, and primary names (the calls a wallet makes, what they read, CCIP-Read). Also `ethrex-statedump` (feature `ethrex-dump`), which writes an ethrex node's account table, or the storage of chosen contracts, as a snapshot CSV stamped at the chain head. |
 
 ## Build & run
 
@@ -282,8 +296,9 @@ scripts/roleswap-demo.sh
 Everything above runs on synthetic data. Pointing the same server at
 mainnet needs two things from the operator:
 
-1. **A snapshot CSV**: one row per account, `address,nonce,balance_wei`,
-   plus a `# block=N` header line recording the block it represents.
+1. **A snapshot CSV**: one row per account, `address,nonce,balance_wei`
+   and optionally `delegate`, plus a `# block=N` header line recording the
+   block it represents.
    `ethrex-statedump` produces it from an ethrex node, reading the node's
    flat account table through a RocksDB secondary instance while the node
    keeps running (all of mainnet in a few minutes). That table trails the
@@ -314,7 +329,8 @@ Then:
 
 ```bash
 # Dump an ethrex node's accounts, next to the node (building it needs
-# libclang; --min-balance 1 keeps only accounts holding ETH, about half):
+# libclang; --min-balance 1 keeps the accounts holding ETH, about half,
+# and every account that delegates its code):
 cargo run --release -p pir-chain --features ethrex-dump \
     --bin ethrex-statedump -- --datadir /path/to/ethrex/mainnet \
     --out accounts.csv --min-balance 1
@@ -334,6 +350,41 @@ cargo run --release -p pir-server -- --accounts-csv accounts.csv \
 cargo run --release -p pir-client -- --server http://HOST:8080 \
     lookup 0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045
 ```
+
+### Delegated code (EIP-7702)
+
+An account's value also holds the contract it delegates its code to. Under
+EIP-7702 an EOA's code is either empty or the 23-byte designator
+`0xef0100 ‖ delegate`, so the 20-byte delegate is all of it, and one lookup
+answers `eth_getBalance`, `eth_getTransactionCount` and `eth_getCode` for the
+address together. Wallets read the three together: kohaku-commons reads every
+account's nonce and code to tell which smart-account implementation it
+delegates to, and kohaku-cli reads them for the addresses it derives and
+before batching calls through a delegation.
+
+```rust
+if let Some(found) = client.lookup_address(&address)? {
+    let a = parse_account_value(&found.value).unwrap();  // a.balance, a.nonce, a.delegate
+    let code = a.code();                                  // empty, or 0xef0100 ‖ delegate
+}
+```
+
+- **In a middleware**, answer `eth_getCode(address)` for the wallet's own
+  addresses from the same lookup that answers their balance and nonce.
+  Otherwise the code request still takes the address to the RPC.
+- **Only for EOAs.** A contract's code does not fit and reads as none, so the
+  answer is right only for an address known to be an EOA, which a wallet's
+  own addresses are.
+- **No match means no ETH and no code.** The table holds every account with
+  ETH and every delegated account whatever it holds, since a sponsored
+  account can transact with none. Its nonce is not in the table, though: an
+  account that spent all its ETH is left out.
+- **Followed block by block**, like the balance. Setting or changing a
+  delegation shows in the block's state diff. Clearing one does not, since
+  the node leaves empty code out of the diff, so the follower asks
+  `eth_getCode` at that block about every delegated account whose nonce
+  moved (clearing takes an authorization, which moves the nonce). That is 10
+  to 20 accounts a block on mainnet.
 
 ## Token balances
 

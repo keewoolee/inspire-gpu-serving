@@ -123,7 +123,13 @@ fn run_lookup(client: &mut PirClient, address: &[u8]) {
         Some(l) => {
             let ms = t0.elapsed().as_secs_f64() * 1e3;
             match parse_account_value(&l.value) {
-                Some(a) => println!("balance: {} wei\nnonce:   {}", a.balance, a.nonce),
+                Some(a) => {
+                    println!("balance: {} wei\nnonce:   {}", a.balance, a.nonce);
+                    match a.delegate {
+                        Some(d) => println!("code:    0x{} (delegates to 0x{})", hex::encode(a.code()), hex::encode(d)),
+                        None => println!("code:    none (if an EOA)"),
+                    }
+                }
                 None => println!("value: 0x{}", hex::encode(&l.value)),
             }
             match l.source {

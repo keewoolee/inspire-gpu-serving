@@ -11,6 +11,7 @@
 //! The DB-matrix conversion lives in `slots` and targets the inspire-gpu
 //! backend's row-major 15-bit slot format.
 
+use crate::account::{AccountValue, ACCOUNT_VALUE_SIZE};
 use crate::manifest::KeyDerivation;
 use rayon::prelude::*;
 use sha3::{
@@ -504,6 +505,8 @@ impl CuckooTable {
     /// Supports both column orders:
     ///   - `address,nonce,balance_wei`
     ///   - `balance_wei,address,nonce`
+    /// and an optional `delegate` column, the hex address an account
+    /// delegates its code to under EIP-7702, empty for none.
     /// First line should contain `block=NUMBER` metadata.
     /// Returns (block_number, num_accounts_inserted).
     pub fn build_from_csv(&mut self, path: &Path) -> io::Result<(u64, usize)> {
@@ -517,6 +520,7 @@ impl CuckooTable {
         let mut col_addr: usize = 0;
         let mut col_nonce: usize = 1;
         let mut col_balance: usize = 2;
+        let mut col_delegate: Option<usize> = None;
         let mut header_parsed = false;
 
         for line_result in reader.lines() {
@@ -565,6 +569,8 @@ impl CuckooTable {
                         col_nonce = i;
                     } else if c.contains("balance") {
                         col_balance = i;
+                    } else if c == "delegate" {
+                        col_delegate = Some(i);
                     }
                 }
                 header_parsed = true;
@@ -590,15 +596,34 @@ impl CuckooTable {
                 Err(_) => continue,
             };
 
-            let balance: u128 = balance_str.parse().unwrap_or(0);
-            let balance_bytes = balance.to_be_bytes();
-            let nonce: u64 = nonce_str.parse().unwrap_or(0);
+            // A delegate that does not parse stops the load: the file is
+            // generated, and reading it as none would serve wrong code.
+            let delegate = match col_delegate.and_then(|i| parts.get(i)).map(|d| d.trim()) {
+                None | Some("") => None,
+                Some(d) => {
+                    let parsed = hex::decode(d.strip_prefix("0x").unwrap_or(d))
+                        .ok()
+                        .and_then(|b| <[u8; 20]>::try_from(b).ok());
+                    match parsed {
+                        Some(d) => Some(d),
+                        None => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("bad delegate {d:?} for {address_str}"),
+                            ))
+                        }
+                    }
+                }
+            };
+            let value = AccountValue {
+                balance: balance_str.parse().unwrap_or(0),
+                nonce: nonce_str.parse().unwrap_or(0),
+                delegate,
+            };
 
-            // Cell: [20B address][16B zero][16B balance BE][8B nonce BE]
             let mut cell = [0u8; MAX_CELL_SIZE];
             cell[..ks].copy_from_slice(&address);
-            cell[ks + 16..ks + 32].copy_from_slice(&balance_bytes);
-            cell[ks + 32..ks + 40].copy_from_slice(&nonce.to_be_bytes());
+            cell[ks..ks + ACCOUNT_VALUE_SIZE].copy_from_slice(&value.pack());
 
             self.insert_fast(&cell, &mut rng);
             num_accounts += 1;
@@ -749,14 +774,14 @@ impl CuckooTable {
         Ok(written)
     }
 
-    /// Export all occupied cells to CSV format: `address,nonce,balance_wei`.
+    /// Export all occupied cells to CSV format: `address,nonce,balance_wei,delegate`.
     /// First line is `# block=BLOCK_NUMBER`, second line is the header.
     pub fn export_csv(&self, path: &Path, block_number: u64) -> io::Result<usize> {
         use std::io::Write;
         let ks = self.params.key_size;
         let mut writer = std::io::BufWriter::with_capacity(64 * 1024 * 1024, File::create(path)?);
         writeln!(writer, "# block={}", block_number)?;
-        writeln!(writer, "address,nonce,balance_wei")?;
+        writeln!(writer, "address,nonce,balance_wei,delegate")?;
 
         let t0 = Instant::now();
         let mut count = 0usize;
@@ -764,11 +789,9 @@ impl CuckooTable {
             for c in 0..self.used[b] as usize {
                 let cell = self.cell_slice(b, c);
                 let address = &cell[..ks];
-                let balance_bytes = &cell[ks + 16..ks + 32];
-                let nonce_bytes = &cell[ks + 32..ks + 40];
-                let balance = u128::from_be_bytes(balance_bytes.try_into().unwrap());
-                let nonce = u64::from_be_bytes(nonce_bytes.try_into().unwrap());
-                writeln!(writer, "0x{},{},{}", hex::encode(address), nonce, balance)?;
+                let a = AccountValue::unpack(&cell[ks..ks + ACCOUNT_VALUE_SIZE]).unwrap();
+                let delegate = a.delegate.map(|d| format!("0x{}", hex::encode(d))).unwrap_or_default();
+                writeln!(writer, "0x{},{},{},{}", hex::encode(address), a.nonce, a.balance, delegate)?;
                 count += 1;
                 if count % 4_000_000 == 0 {
                     eprint!("\r  Exporting CSV... {}M accounts    ", count / 1_000_000);
@@ -914,6 +937,38 @@ mod tests {
         assert_eq!(nonce, 5);
 
         std::fs::remove_file(&csv_path).ok();
+    }
+
+    /// A delegate column fills the first twenty bytes, an empty cell leaves
+    /// them zero, and the table writes it back out the same way.
+    #[test]
+    fn build_from_csv_reads_delegates() {
+        let path = std::env::temp_dir().join("test_delegates.csv");
+        std::fs::write(
+            &path,
+            "# block=7\naddress,nonce,balance_wei,delegate\n\
+             0x1111111111111111111111111111111111111111,3,100,0x63c0c19a282a1b52b07dd5a65b58948a07dae32b\n\
+             0x2222222222222222222222222222222222222222,0,5,\n",
+        )
+        .unwrap();
+        let params = CuckooParams::new(100, 20, 40, DETERMINISTIC_SEED);
+        let mut table = CuckooTable::new(params.clone());
+        assert_eq!(table.build_from_csv(&path).unwrap(), (7, 2));
+        let read = |table: &CuckooTable, a: u8| AccountValue::unpack(table.lookup(&[a; 20]).unwrap()).unwrap();
+        let delegate = hex::decode("63c0c19a282a1b52b07dd5a65b58948a07dae32b").unwrap();
+        assert_eq!(read(&table, 0x11).delegate.map(|d| d.to_vec()), Some(delegate));
+        assert_eq!((read(&table, 0x11).balance, read(&table, 0x11).nonce), (100, 3));
+        assert_eq!(read(&table, 0x22).delegate, None);
+
+        table.export_csv(&path, 7).unwrap();
+        let mut again = CuckooTable::new(params);
+        again.build_from_csv(&path).unwrap();
+        assert_eq!(read(&again, 0x11), read(&table, 0x11));
+        assert_eq!(read(&again, 0x22), read(&table, 0x22));
+
+        std::fs::write(&path, "address,nonce,balance_wei,delegate\n0x1111111111111111111111111111111111111111,0,1,0x12\n").unwrap();
+        assert!(CuckooTable::new(CuckooParams::new(100, 20, 40, DETERMINISTIC_SEED)).build_from_csv(&path).is_err());
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
 
+use pir_keyword::account::{delegate_from_code, AccountValue};
 use pir_keyword::cuckoo::CuckooTable;
 
 /// Cap on a JSON-RPC response body. A block's state diff runs to tens of
@@ -27,11 +28,15 @@ pub struct EthRpc {
     diff_support: AtomicU8,
 }
 
-/// State change extracted from a block: an address with its new balance and nonce.
+/// State change extracted from a block: an address with its new balance,
+/// nonce and EIP-7702 delegate.
 pub struct AccountUpdate {
     pub address: Vec<u8>, // 20 bytes
     pub balance: Vec<u8>, // 32 bytes, big-endian
     pub nonce: u64,
+    /// The contract the account's code delegates to, if its code is an
+    /// EIP-7702 designator.
+    pub delegate: Option<[u8; 20]>,
 }
 
 /// A contract storage slot's value at the end of a block. Zero means the
@@ -185,11 +190,11 @@ impl EthRpc {
         addrs
     }
 
-    /// Batch-fetch balance and nonce for a list of addresses.
+    /// Batch-fetch balance, nonce and delegate for a list of addresses.
     /// Uses "latest" to avoid requiring an archive node.
     pub fn get_account_states(&self, addresses: &[Vec<u8>]) -> Result<Vec<AccountUpdate>, String> {
         let block_tag = "latest";
-        let mut requests = Vec::with_capacity(addresses.len() * 2);
+        let mut requests = Vec::with_capacity(addresses.len() * 3);
 
         for addr in addresses {
             let addr_hex = format!("0x{}", hex::encode(addr));
@@ -198,11 +203,12 @@ impl EthRpc {
                 "eth_getTransactionCount".to_string(),
                 json!([&addr_hex, block_tag]),
             ));
+            requests.push(("eth_getCode".to_string(), json!([&addr_hex, block_tag])));
         }
 
         // Split into chunks and pace them: public endpoints rate-limit by
         // calls per second, and every entry in a JSON-RPC batch counts.
-        let chunk_size = 100; // 50 addresses × 2 calls each
+        let chunk_size = 150; // 50 addresses × 3 calls each
         let mut all_results = Vec::with_capacity(requests.len());
         for (i, chunk) in requests.chunks(chunk_size).enumerate() {
             if i > 0 {
@@ -214,16 +220,19 @@ impl EthRpc {
 
         let mut updates = Vec::with_capacity(addresses.len());
         for (i, addr) in addresses.iter().enumerate() {
-            let balance_val = &all_results[i * 2];
-            let nonce_val = &all_results[i * 2 + 1];
+            let balance_val = &all_results[i * 3];
+            let nonce_val = &all_results[i * 3 + 1];
+            let code_val = &all_results[i * 3 + 2];
 
             let balance = parse_hex_u256(balance_val);
             let nonce = parse_hex_u64(nonce_val).unwrap_or(0);
+            let delegate = code_val.as_str().and_then(parse_hex_bytes).and_then(|c| delegate_from_code(&c));
 
             updates.push(AccountUpdate {
                 address: addr.clone(),
                 balance,
                 nonce,
+                delegate,
             });
         }
 
@@ -241,6 +250,13 @@ impl EthRpc {
     /// moved but whose nonce did not arrives without a nonce; each field falls
     /// back to `pre`, which is that account's state entering the transaction.
     /// Later transactions overwrite earlier ones, leaving the block's end state.
+    ///
+    /// The one change a diff cannot show is a delegation being cleared: an
+    /// ethrex node leaves code out of `post` when it becomes empty, just as
+    /// when it stays the same. Clearing takes an authorization, which moves
+    /// the account's nonce, so a delegated account whose nonce moved is
+    /// checked with `eth_getCode` at the block. That is ten to twenty accounts
+    /// a block on mainnet, in one batch.
     pub fn fetch_block_updates_via_diff(
         &self,
         block_num: u64,
@@ -249,7 +265,37 @@ impl EthRpc {
         let config = json!({"tracer": "prestateTracer", "tracerConfig": {"diffMode": true}});
         let result = self.call("debug_traceBlockByNumber", json!([block_hex, config]))?;
         let traces = result.as_array().ok_or("trace result is not an array")?;
-        Ok(updates_from_prestate_diff(traces))
+        let (mut updates, unsure) = updates_from_prestate_diff(traces);
+        if !unsure.is_empty() {
+            let addresses: Vec<&[u8]> = unsure.iter().map(|&i| updates[i].address.as_slice()).collect();
+            let delegates = self.delegates_at(&addresses, block_num)?;
+            for (&i, delegate) in unsure.iter().zip(delegates) {
+                updates[i].delegate = delegate;
+            }
+        }
+        Ok(updates)
+    }
+
+    /// The delegate of each address at the end of `block`, from its code.
+    pub fn delegates_at(&self, addresses: &[&[u8]], block: u64) -> Result<Vec<Option<[u8; 20]>>, String> {
+        let block_hex = format!("0x{:x}", block);
+        let requests: Vec<(&str, Value)> = addresses
+            .iter()
+            .map(|a| ("eth_getCode", json!([format!("0x{}", hex::encode(a)), block_hex])))
+            .collect();
+        self.batch_raw(&requests)?
+            .into_iter()
+            .zip(addresses)
+            .map(|(result, a)| {
+                let code = result
+                    .map_err(|e| format!("eth_getCode 0x{} at block {block}: {e}", hex::encode(a)))?;
+                let code = code
+                    .as_str()
+                    .and_then(parse_hex_bytes)
+                    .ok_or_else(|| format!("eth_getCode 0x{} returned {code}", hex::encode(a)))?;
+                Ok(delegate_from_code(&code))
+            })
+            .collect()
     }
 
     /// Fetch the storage changes a block made to `contracts`, from the same
@@ -625,23 +671,21 @@ pub struct ResyncResult {
     pub total_changes: usize,
 }
 
-/// Convert an AccountUpdate to the 40-byte value format used by the cuckoo table.
-/// Format: [16B zero-pad][16B balance (last 16 bytes, BE)][8B nonce (BE)]
+/// Convert an AccountUpdate to the 40-byte value an account table holds
+/// (see `pir_keyword::account`).
 pub fn account_update_to_value(update: &AccountUpdate) -> Vec<u8> {
-    let mut value = vec![0u8; 40];
-    // Balance: take last 16 bytes (low 128 bits) — fits u128
-    // The full balance is 32 bytes big-endian; copy last 16 into value[16..32]
+    // The balance arrives as 32 bytes; every real one fits the low 16.
     let bal = &update.balance;
-    if bal.len() >= 16 {
-        value[16..32].copy_from_slice(&bal[bal.len() - 16..]);
-    } else {
-        // Balance fits in fewer than 16 bytes, right-align
-        let start = 32 - bal.len();
-        value[start..32].copy_from_slice(bal);
+    let mut low = [0u8; 16];
+    let take = bal.len().min(16);
+    low[16 - take..].copy_from_slice(&bal[bal.len() - take..]);
+    AccountValue {
+        balance: u128::from_be_bytes(low),
+        nonce: update.nonce,
+        delegate: update.delegate,
     }
-    // Nonce
-    value[32..40].copy_from_slice(&update.nonce.to_be_bytes());
-    value
+    .pack()
+    .to_vec()
 }
 
 // ============================================================================
@@ -652,6 +696,11 @@ fn parse_hex_u64(val: &Value) -> Result<u64, String> {
     let s = val.as_str().ok_or("expected hex string")?;
     let s = s.strip_prefix("0x").unwrap_or(s);
     u64::from_str_radix(s, 16).map_err(|e| format!("bad hex u64: {}", e))
+}
+
+/// Bytes as `eth_getCode` and the tracer return them: 0x, then whole bytes.
+fn parse_hex_bytes(s: &str) -> Option<Vec<u8>> {
+    hex::decode(s.strip_prefix("0x").unwrap_or(s)).ok()
 }
 
 fn parse_hex_u256(val: &Value) -> Vec<u8> {
@@ -689,11 +738,14 @@ fn parse_hex_u256(val: &Value) -> Vec<u8> {
     out
 }
 
-/// Fold a block's per-transaction prestate diffs into one update per account.
+/// Fold a block's per-transaction prestate diffs into one update per account,
+/// and say which updates' delegates the diffs could not settle (indices into
+/// the updates).
 ///
-/// See `fetch_block_updates_via_diff` for why each field falls back to `pre`.
-fn updates_from_prestate_diff(traces: &[Value]) -> Vec<AccountUpdate> {
-    let mut state: HashMap<Vec<u8>, (Vec<u8>, u64)> = HashMap::new();
+/// See `fetch_block_updates_via_diff` for why each field falls back to `pre`,
+/// and why a delegated account whose nonce moved is unsettled.
+fn updates_from_prestate_diff(traces: &[Value]) -> (Vec<AccountUpdate>, Vec<usize>) {
+    let mut state: HashMap<Vec<u8>, (Vec<u8>, u64, Option<[u8; 20]>, bool)> = HashMap::new();
     let mut order: Vec<Vec<u8>> = Vec::new();
 
     for trace in traces {
@@ -718,23 +770,44 @@ fn updates_from_prestate_diff(traces: &[Value]) -> Vec<AccountUpdate> {
             let nonce = pick_field(changed, before, "nonce")
                 .and_then(parse_json_nonce)
                 .unwrap_or(0);
-            if state.insert(address.clone(), (balance, nonce)).is_none() {
+            let code_of = |account: &Value| {
+                account.get("code").and_then(|c| c.as_str()).and_then(parse_hex_bytes)
+            };
+            let (delegate, unsure) = match (code_of(changed), before.and_then(code_of)) {
+                (Some(code), _) => (delegate_from_code(&code), false),
+                (None, Some(code)) => {
+                    let delegate = delegate_from_code(&code);
+                    (delegate, delegate.is_some() && changed.get("nonce").is_some())
+                }
+                (None, None) => (None, false),
+            };
+            if state.insert(address.clone(), (balance, nonce, delegate, unsure)).is_none() {
                 order.push(address);
             }
         }
     }
 
-    order
+    let mut unsure_at = Vec::new();
+    let updates = order
         .into_iter()
         .filter_map(|address| {
-            let (balance, nonce) = state.remove(&address)?;
-            Some(AccountUpdate {
+            let (balance, nonce, delegate, unsure) = state.remove(&address)?;
+            Some((address, balance, nonce, delegate, unsure))
+        })
+        .enumerate()
+        .map(|(i, (address, balance, nonce, delegate, unsure))| {
+            if unsure {
+                unsure_at.push(i);
+            }
+            AccountUpdate {
                 address,
                 balance,
                 nonce,
-            })
+                delegate,
+            }
         })
-        .collect()
+        .collect();
+    (updates, unsure_at)
 }
 
 /// Fold a block's per-transaction prestate diffs into the end-of-block value of
@@ -935,18 +1008,22 @@ mod tests {
 
     /// An account value round-trips through the layout the client decodes.
     #[test]
-    fn account_value_round_trips_balance_and_nonce() {
+    fn account_value_round_trips_balance_nonce_and_delegate() {
         let update = AccountUpdate {
             address: vec![0xab; 20],
             balance: parse_hex_u256(&json!("0x92a5e054800d0b5")),
             nonce: 116_692,
+            delegate: Some([0x63; 20]),
         };
         let value = account_update_to_value(&update);
-        assert_eq!(value.len(), 40);
-        let balance = u128::from_be_bytes(value[16..32].try_into().unwrap());
-        let nonce = u64::from_be_bytes(value[32..40].try_into().unwrap());
-        assert_eq!(balance, 660_443_672_139_059_381);
-        assert_eq!(nonce, 116_692);
+        assert_eq!(
+            AccountValue::unpack(&value),
+            Some(AccountValue {
+                balance: 660_443_672_139_059_381,
+                nonce: 116_692,
+                delegate: Some([0x63; 20]),
+            })
+        );
     }
 
     const A: &str = "0x1111111111111111111111111111111111111111";
@@ -979,7 +1056,7 @@ mod tests {
                           B: {"storage": {"0x00": "0x01"}} },
             }
         })];
-        let updates = updates_from_prestate_diff(&traces);
+        let (updates, _) = updates_from_prestate_diff(&traces);
         assert_eq!(updates.len(), 2);
         assert_eq!(balance_of(find(&updates, A)), 200);
         assert_eq!(find(&updates, A).nonce, 7);
@@ -1001,7 +1078,7 @@ mod tests {
                 "post": { A: {"nonce": 9} },
             }}),
         ];
-        let updates = updates_from_prestate_diff(&traces);
+        let (updates, _) = updates_from_prestate_diff(&traces);
         assert_eq!(updates.len(), 1, "one update per account, not per transaction");
         assert_eq!(balance_of(&updates[0]), 200);
         assert_eq!(updates[0].nonce, 9);
@@ -1014,7 +1091,7 @@ mod tests {
             "pre":  {},
             "post": { C: {"balance": "0x1", "nonce": 0} },
         }})];
-        let updates = updates_from_prestate_diff(&traces);
+        let (updates, _) = updates_from_prestate_diff(&traces);
         assert_eq!(updates.len(), 1);
         assert_eq!(balance_of(&updates[0]), 1);
         assert_eq!(updates[0].nonce, 0);
@@ -1027,9 +1104,71 @@ mod tests {
             "pre":  { A: {"balance": "0x64", "nonce": 7} },
             "post": { A: {"balance": "0x92a5e054800d0b5"} },
         })];
-        let updates = updates_from_prestate_diff(&traces);
+        let (updates, _) = updates_from_prestate_diff(&traces);
         assert_eq!(balance_of(&updates[0]), 660_443_672_139_059_381);
         assert_eq!(updates[0].nonce, 7);
+    }
+
+    const DESIGNATOR_1: &str = "0xef010063c0c19a282a1b52b07dd5a65b58948a07dae32b";
+    const DESIGNATOR_2: &str = "0xef010084d05511614272694d3a9cebe896514dbde51f40";
+
+    fn delegate(designator: &str) -> Option<[u8; 20]> {
+        delegate_from_code(&parse_hex_bytes(designator).unwrap())
+    }
+
+    /// Delegation as an ethrex node traced it on mainnet (blocks 26,153,077 to
+    /// 26,153,120): set on a new account, changed, kept while the balance
+    /// moves, and possibly cleared, where `post` looks the same as when
+    /// nothing happened to the code but the nonce moved.
+    #[test]
+    fn diff_reads_delegates_and_flags_what_it_cannot_settle() {
+        let traces = [json!({"result": {
+            "pre":  { A: {},
+                      B: {"balance": "0x0", "code": DESIGNATOR_1, "nonce": 545_278},
+                      C: {"balance": "0xd454fe5cb745f", "code": DESIGNATOR_1, "nonce": 56} },
+            "post": { A: {"code": DESIGNATOR_1, "nonce": 1},
+                      B: {"code": DESIGNATOR_2, "nonce": 545_279},
+                      C: {"balance": "0xc8caf4d94590e58"} },
+        }}), json!({"result": {
+            "pre":  { USDT: {"balance": "0x1", "code": "0x6080604052", "nonce": 1},
+                      "0x09b1e13a3eb32f1064990b1ab130492da9d1e76e":
+                          {"balance": "0x1639771d0190b5d", "code": DESIGNATOR_1, "nonce": 719} },
+            "post": { USDT: {"balance": "0x2"},
+                      "0x09b1e13a3eb32f1064990b1ab130492da9d1e76e":
+                          {"balance": "0x16350981c84169d", "nonce": 721} },
+        }})];
+        let (updates, unsure) = updates_from_prestate_diff(&traces);
+        assert_eq!(find(&updates, A).delegate, delegate(DESIGNATOR_1));
+        assert_eq!(find(&updates, B).delegate, delegate(DESIGNATOR_2));
+        assert_eq!(find(&updates, C).delegate, delegate(DESIGNATOR_1));
+        assert_eq!(find(&updates, USDT).delegate, None, "a contract has no delegate");
+        let cleared = "0x09b1e13a3eb32f1064990b1ab130492da9d1e76e";
+        let flagged: Vec<String> =
+            unsure.iter().map(|&i| format!("0x{}", hex::encode(&updates[i].address))).collect();
+        assert_eq!(flagged, vec![cleared.to_string()]);
+    }
+
+    /// The last transaction decides, so a delegation set and then followed by
+    /// a transaction that moved the nonce is unsettled again, and one cleared
+    /// to the zero address on a node that writes empty code is settled.
+    #[test]
+    fn diff_delegates_follow_the_last_transaction() {
+        let traces = [
+            json!({"result": {
+                "pre":  { A: {"balance": "0x5", "nonce": 3} },
+                "post": { A: {"code": DESIGNATOR_1, "nonce": 4} },
+            }}),
+            json!({"result": {
+                "pre":  { A: {"balance": "0x5", "code": DESIGNATOR_1, "nonce": 4},
+                          B: {"balance": "0x5", "code": DESIGNATOR_2, "nonce": 9} },
+                "post": { A: {"nonce": 5}, B: {"code": "0x", "nonce": 10} },
+            }}),
+        ];
+        let (updates, unsure) = updates_from_prestate_diff(&traces);
+        assert_eq!(find(&updates, A).delegate, delegate(DESIGNATOR_1));
+        assert_eq!(find(&updates, B).delegate, None);
+        assert_eq!(unsure.len(), 1);
+        assert_eq!(updates[unsure[0]].address, parse_hex_address(A).unwrap());
     }
 
     #[test]

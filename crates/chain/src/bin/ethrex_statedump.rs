@@ -22,6 +22,11 @@
 //! account at its head state, so starting from a block the data already
 //! reflects is safe.
 //!
+//! An account delegated under EIP-7702 holds the designator `0xef0100 ‖
+//! delegate` as its code, so the leaf's code hash leads to it. Codes sit in
+//! `account_codes` by hash, with their lengths in `account_code_metadata`, so
+//! only a 23-byte code is ever read, and each distinct hash once.
+//!
 //! Contract storage sits in a second table, `storage_flatkeyvalue`, keyed by
 //! the contract's address hash followed by each slot's hash. `--storage-of`
 //! dumps the slots of chosen contracts, such as tokens, into a storage
@@ -35,6 +40,7 @@
 
 use clap::Parser;
 use pir_chain::rpc::EthRpc;
+use pir_keyword::account::delegate_from_code;
 use pir_keyword::storage::{mapping_slot, storage_key_from_hashes};
 use rocksdb::{ColumnFamilyDescriptor, Direction, IteratorMode, MergeOperands, Options, DB};
 use std::collections::HashMap;
@@ -43,6 +49,13 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 const ACCOUNT_FLATKEYVALUE: &str = "account_flatkeyvalue";
+const ACCOUNT_CODES: &str = "account_codes";
+const ACCOUNT_CODE_METADATA: &str = "account_code_metadata";
+/// keccak256 of empty code, which every account without code carries.
+const EMPTY_CODE_HASH: [u8; 32] = [
+    0xc5, 0xd2, 0x46, 0x01, 0x86, 0xf7, 0x23, 0x3c, 0x92, 0x7e, 0x7d, 0xb2, 0xdc, 0xc7, 0x03, 0xc0,
+    0xe5, 0x00, 0xb6, 0x53, 0xca, 0x82, 0x27, 0x3b, 0x7b, 0xfa, 0xd8, 0x04, 0x5d, 0x85, 0xa4, 0x70,
+];
 const STORAGE_FLATKEYVALUE: &str = "storage_flatkeyvalue";
 /// ethrex attaches this to `transaction_locations`. RocksDB refuses to open a
 /// column family whose recorded merge operator is missing, and this tool never
@@ -84,7 +97,9 @@ struct Args {
     /// table with it. The cost is that a client asking about a dropped account
     /// gets non-membership rather than its nonce; such an account cannot pay
     /// for a transaction anyway, and it rejoins the served set through the
-    /// sidecar the moment it receives anything.
+    /// sidecar the moment it receives anything. An account that delegates its
+    /// code is kept whatever it holds, since a wallet asks for its code too,
+    /// and a sponsor can pay for its transactions.
     #[clap(long, default_value_t = 0)]
     min_balance: u128,
 
@@ -205,6 +220,7 @@ fn open_secondary(primary: &PathBuf, secondary: &PathBuf) -> Result<DB, rocksdb:
 /// node. Tries the key both with and without the leaf terminator and says which
 /// one the table actually uses.
 fn probe_address<C: rocksdb::AsColumnFamilyRef>(db: &DB, cf: &C, address: &str) {
+    let mut codes = Codes::new(db);
     let Some(bytes) = parse_address(address) else {
         println!("{address}: not a 20-byte hex address");
         return;
@@ -219,10 +235,15 @@ fn probe_address<C: rocksdb::AsColumnFamilyRef>(db: &DB, cf: &C, address: &str) 
     ] {
         match db.get_cf(cf, &key) {
             Ok(Some(value)) => match decode_account(&value) {
-                Some((nonce, balance)) => {
+                Some((nonce, balance, code_hash)) => {
                     println!("  found as     {shape}");
                     println!("  nonce         {nonce}");
                     println!("  balance       {balance} wei");
+                    println!("  code hash     0x{}", hex::encode(code_hash));
+                    match codes.delegate(&code_hash) {
+                        Some(d) => println!("  delegate      0x{}", hex::encode(d)),
+                        None => println!("  delegate      none"),
+                    }
                     return;
                 }
                 None => println!("  {shape}: leaf present but undecodable"),
@@ -234,8 +255,59 @@ fn probe_address<C: rocksdb::AsColumnFamilyRef>(db: &DB, cf: &C, address: &str) 
     println!("  not present under either key shape");
 }
 
-/// Account values the replay has seen, by address hash: (nonce, balance).
-type ReplayedAccounts = HashMap<[u8; 32], (u64, u128)>;
+/// Account values the replay has seen, by address hash: (nonce, balance,
+/// delegate).
+type ReplayedAccounts = HashMap<[u8; 32], (u64, u128, Option<[u8; 20]>)>;
+
+/// The delegate each code hash names, read from the node's code tables once
+/// per hash.
+struct Codes<'a> {
+    db: &'a DB,
+    seen: HashMap<[u8; 32], Option<[u8; 20]>>,
+    /// Code hashes the node holds no code for, which read as no delegate.
+    missing: u64,
+}
+
+impl<'a> Codes<'a> {
+    fn new(db: &'a DB) -> Self {
+        Codes { db, seen: HashMap::new(), missing: 0 }
+    }
+
+    fn delegate(&mut self, code_hash: &[u8; 32]) -> Option<[u8; 20]> {
+        if *code_hash == EMPTY_CODE_HASH {
+            return None;
+        }
+        if let Some(&known) = self.seen.get(code_hash) {
+            return known;
+        }
+        let found = self.read(code_hash);
+        self.seen.insert(*code_hash, found);
+        found
+    }
+
+    /// A designator is 23 bytes, so a code of any other length is skipped
+    /// from its length alone, without reading the code.
+    fn read(&mut self, code_hash: &[u8; 32]) -> Option<[u8; 20]> {
+        let get = |family: &str| {
+            let cf = self.db.cf_handle(family).unwrap_or_else(|| fail("no code table", family));
+            self.db
+                .get_cf(&cf, code_hash)
+                .unwrap_or_else(|e| fail(&format!("reading {family}"), e))
+        };
+        if let Some(length) = get(ACCOUNT_CODE_METADATA) {
+            if length.len() == 8 && u64::from_be_bytes(length[..].try_into().unwrap()) != 23 {
+                return None;
+            }
+        }
+        let Some(stored) = get(ACCOUNT_CODES) else {
+            self.missing += 1;
+            return None;
+        };
+        // The bytecode comes first, as an RLP string, then the node's jump
+        // table.
+        rlp_item(&stored).and_then(|(code, _)| delegate_from_code(code))
+    }
+}
 
 /// Write every account as a snapshot CSV, stamped at the chain head, for the
 /// reason `dump_storage` gives. Accounts do have a fallback for blocks the node
@@ -279,20 +351,39 @@ fn dump_accounts(args: &Args) {
     // derives keys the same way without being told.
     writeln!(out, "# key_derivation=keccak").unwrap();
     if args.min_balance > 0 {
-        writeln!(out, "# accounts holding under {} wei are left out", args.min_balance).unwrap();
+        writeln!(
+            out,
+            "# accounts holding under {} wei are left out, unless they delegate",
+            args.min_balance
+        )
+        .unwrap();
     }
-    writeln!(out, "address,nonce,balance_wei").unwrap();
+    writeln!(out, "address,nonce,balance_wei,delegate").unwrap();
 
     let t1 = Instant::now();
     let (mut written, mut skipped, mut filtered) = (0u64, 0u64, 0u64);
-    let mut write = |out: &mut BufWriter<std::fs::File>, hash: &[u8; 32], nonce: u64, balance: u128| {
-        if balance < args.min_balance {
+    let (mut delegated, mut delegated_poor) = (0u64, 0u64);
+    let mut write = |out: &mut BufWriter<std::fs::File>,
+                     hash: &[u8; 32],
+                     nonce: u64,
+                     balance: u128,
+                     delegate: Option<[u8; 20]>| {
+        let poor = balance < args.min_balance;
+        if let Some(delegate) = delegate {
+            delegated += 1;
+            delegated_poor += poor as u64;
+            writeln!(out, "{},{},{},0x{}", hex::encode(&hash[..20]), nonce, balance, hex::encode(delegate))
+                .unwrap();
+            return true;
+        }
+        if poor {
             filtered += 1;
             return false;
         }
-        writeln!(out, "{},{},{}", hex::encode(&hash[..20]), nonce, balance).unwrap();
+        writeln!(out, "{},{},{},", hex::encode(&hash[..20]), nonce, balance).unwrap();
         true
     };
+    let mut codes = Codes::new(&db);
 
     let mut limited = false;
     for item in db.iterator_cf(&cf, IteratorMode::Start) {
@@ -304,14 +395,14 @@ fn dump_accounts(args: &Args) {
         let account = match replayed.remove(&hash) {
             Some(account) => account,
             None => match decode_account(&value) {
-                Some(account) => account,
+                Some((nonce, balance, code_hash)) => (nonce, balance, codes.delegate(&code_hash)),
                 None => {
                     skipped += 1;
                     continue;
                 }
             },
         };
-        if !write(&mut out, &hash, account.0, account.1) {
+        if !write(&mut out, &hash, account.0, account.1, account.2) {
             continue;
         }
         written += 1;
@@ -333,8 +424,8 @@ fn dump_accounts(args: &Args) {
     // short by --limit is a sample and leaves them out.
     let mut added = 0u64;
     if !limited {
-        for (hash, (nonce, balance)) in replayed.drain() {
-            if write(&mut out, &hash, nonce, balance) {
+        for (hash, (nonce, balance, delegate)) in replayed.drain() {
+            if write(&mut out, &hash, nonce, balance, delegate) {
                 added += 1;
             }
         }
@@ -355,6 +446,15 @@ fn dump_accounts(args: &Args) {
             100.0 * filtered as f64 / seen as f64
         );
     }
+    println!(
+        "  {delegated} delegate their code ({delegated_poor} of them kept despite holding under {} wei), \
+         from {} distinct code hashes read",
+        args.min_balance,
+        codes.seen.len()
+    );
+    if codes.missing > 0 {
+        println!("  {} code hashes had no code in the node, read as no delegate", codes.missing);
+    }
     if skipped > 0 {
         println!("  {skipped} entries could not be read");
     }
@@ -367,7 +467,7 @@ fn replay_accounts(rpc: &EthRpc, next: &mut u64, replayed: &mut ReplayedAccounts
         for update in rpc.fetch_block_updates_via_diff(block)? {
             let balance = be_u128(minimal(&update.balance))
                 .ok_or_else(|| format!("balance past 128 bits at block {block}"))?;
-            replayed.insert(keccak256(&update.address), (update.nonce, balance));
+            replayed.insert(keccak256(&update.address), (update.nonce, balance, update.delegate));
         }
         Ok(())
     })
@@ -718,13 +818,16 @@ fn nibbles_to_hash(key: &[u8]) -> Option<[u8; 32]> {
     Some(hash)
 }
 
-/// An account leaf is RLP `[nonce, balance, storage_root, code_hash]`.
-/// Only the first two are served, and a balance fits u128 many times over.
-fn decode_account(value: &[u8]) -> Option<(u64, u128)> {
+/// An account leaf is RLP `[nonce, balance, storage_root, code_hash]`. The
+/// code hash leads to the account's delegate, if it has one, and a balance
+/// fits u128 many times over.
+fn decode_account(value: &[u8]) -> Option<(u64, u128, [u8; 32])> {
     let (fields, _) = rlp_list(value)?;
     let (nonce, rest) = rlp_item(fields)?;
-    let (balance, _) = rlp_item(rest)?;
-    Some((be_u64(nonce)?, be_u128(balance)?))
+    let (balance, rest) = rlp_item(rest)?;
+    let (_storage_root, rest) = rlp_item(rest)?;
+    let (code_hash, _) = rlp_item(rest)?;
+    Some((be_u64(nonce)?, be_u128(balance)?, code_hash.try_into().ok()?))
 }
 
 /// One RLP byte string: its payload, and whatever follows it.
@@ -845,7 +948,7 @@ mod tests {
         leaf.extend_from_slice(&[0x11; 32]);
         leaf.push(0xa0);
         leaf.extend_from_slice(&[0x22; 32]);
-        assert_eq!(decode_account(&leaf), Some((1, 1_000_000_000_000_000_000)));
+        assert_eq!(decode_account(&leaf), Some((1, 1_000_000_000_000_000_000, [0x22; 32])));
     }
 
     #[test]
@@ -855,7 +958,7 @@ mod tests {
         leaf.extend_from_slice(&[0x11; 32]);
         leaf.push(0xa0);
         leaf.extend_from_slice(&[0x22; 32]);
-        assert_eq!(decode_account(&leaf), Some((0, 0)));
+        assert_eq!(decode_account(&leaf), Some((0, 0, [0x22; 32])));
     }
 
     #[test]
@@ -867,7 +970,12 @@ mod tests {
         leaf.extend_from_slice(&[0x11; 32]);
         leaf.push(0xa0);
         leaf.extend_from_slice(&[0x22; 32]);
-        assert_eq!(decode_account(&leaf), Some((9, 26_780_479_053_084_510_844)));
+        assert_eq!(decode_account(&leaf), Some((9, 26_780_479_053_084_510_844, [0x22; 32])));
+    }
+
+    #[test]
+    fn empty_code_hash_is_keccak_of_nothing() {
+        assert_eq!(keccak256(&[]), EMPTY_CODE_HASH);
     }
 
     #[test]
