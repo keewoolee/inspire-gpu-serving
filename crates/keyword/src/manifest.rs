@@ -160,6 +160,43 @@ pub struct SidecarBroadcast {
     /// Changes since the snapshot, oldest first.
     #[serde(default)]
     pub entries: Vec<SidecarEntry>,
+    /// Every stealth meta-address in the ERC-6538 registry, as of the latest
+    /// block followed, from a name server. The registry is small enough to
+    /// send whole, which keeps which registrant a wallet asks about private
+    /// without a lookup.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stealth_registry: Vec<StealthEntry>,
+    /// Every name's `stealth-address-scheme-1` text record that is set, from
+    /// a name server: on-chain ones from the resolvers' events, and those of
+    /// the primary names behind a gateway, asked about once an hour. Sent
+    /// whole for the same reason as the registry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stealth_texts: Vec<StealthText>,
+}
+
+/// One name's `stealth-address-scheme-1` text record. Shared wire type
+/// between server and client.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StealthText {
+    /// The name's namehash, 0x-hex, which is also its GNS or WNS id. A text
+    /// call carries it, so a middleware matches calls on it.
+    pub node: String,
+    /// The record, as `text(node, "stealth-address-scheme-1")` returns it.
+    pub value: String,
+}
+
+/// One registrant's stealth meta-address for one scheme, as
+/// `stealthMetaAddressOf(registrant, scheme_id)` on the ERC-6538 registry
+/// returns it. Shared wire type between server and client.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StealthEntry {
+    /// The registrant, 0x-hex.
+    pub registrant: String,
+    /// The stealth address scheme (1 is secp256k1, per ERC-5564).
+    pub scheme_id: u64,
+    /// The registered bytes, 0x-hex. For scheme 1 that is the compressed
+    /// spending and viewing public keys, 66 bytes.
+    pub meta: String,
 }
 
 impl SidecarBroadcast {
@@ -305,9 +342,41 @@ mod tests {
                 value_hex: hex::encode([0x44u8; 40]),
                 block: 24_644_660,
             }],
+            ..Default::default()
         };
         let b2 = SidecarBroadcast::from_json(&b.to_json()).unwrap();
         assert_eq!(b, b2);
+    }
+
+    /// The registry rides along only where there is one, and a broadcast
+    /// without it still reads.
+    #[test]
+    fn stealth_registry_is_optional_on_the_wire() {
+        let plain = SidecarBroadcast { snapshot_block: 7, ..Default::default() };
+        assert!(!plain.to_json().contains("stealth_registry"));
+        assert_eq!(SidecarBroadcast::from_json(r#"{"snapshot_block":7}"#).unwrap(), plain);
+
+        let with = SidecarBroadcast {
+            snapshot_block: 7,
+            stealth_registry: vec![StealthEntry {
+                registrant: format!("0x{}", hex::encode([0x55u8; 20])),
+                scheme_id: 1,
+                meta: format!("0x{}", hex::encode([0x02u8; 66])),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(SidecarBroadcast::from_json(&with.to_json()).unwrap(), with);
+
+        let texts = SidecarBroadcast {
+            snapshot_block: 7,
+            stealth_texts: vec![StealthText {
+                node: format!("0x{}", hex::encode([0x8fu8; 32])),
+                value: "st:eth:0x03".into(),
+            }],
+            ..Default::default()
+        };
+        assert!(!texts.to_json().contains("stealth_registry"));
+        assert_eq!(SidecarBroadcast::from_json(&texts.to_json()).unwrap(), texts);
     }
 
     /// A manifest written before key_derivation existed can only describe an

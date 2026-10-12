@@ -10,7 +10,7 @@ use pir_keyword::cuckoo::{CuckooParams, CuckooTable, DETERMINISTIC_SEED};
 use pir_server::follower::{self, Checkpoint, Feed, FollowerConfig, SimulatorConfig, TRACE_WINDOW};
 use pir_server::generation::{GenerationBuilder, ServingState};
 use pir_server::http::serve;
-use pir_server::names::{read_candidates, NamesTracker, TrackerConfig};
+use pir_server::names::{read_candidates, read_stealth_registrants, read_stealth_texts, NamesTracker, TrackerConfig};
 use pir_server::sidecar::Sidecar;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -63,6 +63,22 @@ struct Args {
     /// the block after it. Otherwise the table is built from the starting set.
     #[clap(long, requires = "names_ens_candidates")]
     names_state: Option<String>,
+
+    /// With --names-ens-candidates: registrations in the ERC-6538 stealth
+    /// registry to start from, one `registrant,scheme_id` per line. The node's
+    /// logs go back only to where it began syncing, so older registrations
+    /// have to be listed. Newer ones are found from the registry's events and
+    /// kept in the saved state.
+    #[clap(long, requires = "names_ens_candidates")]
+    names_stealth_registrants: Option<String>,
+
+    /// With --names-ens-candidates: names to follow the
+    /// `stealth-address-scheme-1` text record of, one `node,contract` per
+    /// line, from the `TextChanged` events that set one. Needed only for
+    /// events older than the node's logs; newer ones are found as they come
+    /// and kept in the saved state.
+    #[clap(long, requires = "names_ens_candidates")]
+    names_stealth_texts: Option<String>,
 
     /// How often to save the name tracker's state, in seconds.
     #[clap(long, default_value_t = 600)]
@@ -233,6 +249,23 @@ fn main() {
                     NamesTracker::new(url, head, ens, ns, cfg())
                 }
             };
+            if let Some(path) = &args.names_stealth_registrants {
+                let registrations = read_stealth_registrants(Path::new(path)).unwrap_or_else(|e| {
+                    eprintln!("error: cannot read {}: {}", path, e);
+                    std::process::exit(2);
+                });
+                tracker.watch_stealth_registrants(registrations);
+            }
+            if let Some(path) = &args.names_stealth_texts {
+                let names = read_stealth_texts(Path::new(path)).unwrap_or_else(|e| {
+                    eprintln!("error: cannot read {}: {}", path, e);
+                    std::process::exit(2);
+                });
+                tracker.watch_stealth_texts(names);
+            }
+            if let Err(e) = tracker.read_stealth().and_then(|_| tracker.read_texts()) {
+                eprintln!("Names: reading the stealth registry or text records failed ({e}); following steps retry it");
+            }
             for (address, names) in tracker.named() {
                 let key = table.params.key_derivation.key(address, table.params.key_size);
                 table.upsert(&key, &names.pack());
@@ -314,6 +347,16 @@ fn main() {
     );
     let first = builder.build(snapshot_block).expect("GPU preprocess failed");
     let state = Arc::new(ServingState::new(first, Arc::new(Sidecar::new())));
+    // A name server sends the stealth registry and text records from its
+    // first lookup on.
+    if let Feed::Names(tracker) = &mut feed {
+        if let Some(list) = tracker.take_stealth_registry() {
+            *state.stealth_registry.lock().unwrap() = list;
+        }
+        if let Some(list) = tracker.take_stealth_texts() {
+            *state.stealth_texts.lock().unwrap() = list;
+        }
+    }
 
     // 4. Chain source (optional): real follower or simulator.
     if let Some(updates_per_block) = args.simulate {

@@ -189,7 +189,9 @@ What has actually been demonstrated, beyond the numbers above:
   GNS 151, WNS 162), in a 2^20-bucket table at 44% load and 0.23 GB of VRAM.
   A sample of 53 lookups matched the chain, and so did all 110 changes the
   server followed live over 10 minutes, checked from another IP. A restart
-  from the saved state serves again within 10 seconds.
+  from the saved state serves again within 10 seconds. The ERC-6538 registry
+  that comes with every lookup matched the node for all 9 registrations, and
+  the 2 stealth text records for their names.
 - **The live-chain path works end to end.** Against a key-less public
   endpoint, the server snapshotted the mainnet head, ingested live
   blocks, flipped, and returned the fresh balance/nonce of an account
@@ -314,7 +316,10 @@ mainnet needs two things from the operator:
 2. **A JSON-RPC endpoint** for staying current. The follower reads each
    block's state diff through `debug_traceBlockByNumber` with
    `prestateTracer` in diff mode, which catches every balance change a
-   transaction makes, internal transfers included. That needs the
+   transaction makes, internal transfers included. Beacon-chain
+   withdrawals are credited outside any transaction, so no diff shows
+   them, and the follower reads them from the block and asks the node
+   about the accounts they credit. That needs the
    node's `debug` namespace but no archive node. A node traces only its
    recent blocks (128 on ethrex, about 25 minutes), so a server started
    from a snapshot older than that fills in the older blocks through the
@@ -508,11 +513,22 @@ name is checked both ways: the address's reverse record names it, and the
 name's forward record points back at the address. GNS and WNS check the same
 inside `reverseResolve`.
 
+Every names lookup also brings the whole ERC-6538 registry of stealth
+meta-addresses (`0x6538E6bf4B0eBd30A8Ea093027Ac2422ce5d6538`), which a wallet
+reads alongside an address's names, and every set `stealth-address-scheme-1`
+text record, which a wallet reads from its name before the registry. On
+mainnet that is 9 registrations and 2 records, under a kilobyte, so both ride
+in the response's sidecar broadcast instead of taking lookups of their own.
+Every client gets the same lists, so answering from them says nothing about
+which registrant or name a wallet asked about, its own or a recipient's.
+
 From code, or from the command line:
 
 ```rust
 let mut client = PirClient::connect("http://HOST:8092")?;
 let found = client.names(&address)?;   // found.names.ens, .gns, .wns
+let meta = client.stealth_meta_address_of(&registrant, 1)?;  // from the same response, empty for none
+let text = client.stealth_text_of("luca.gwei")?;              // likewise, the name's record
 ```
 
 ```bash
@@ -535,16 +551,29 @@ these from one names lookup per address, the forward checks included:
 | `reverseResolve(address)` on GNS or WNS | `0x9af8b7aa` | `abi.encode(string name)`, `""` for no name |
 | `computeId(string fullName)` on GNS or WNS | `0xfb021939` | the name's namehash as a `uint256`. The function is pure, so the middleware computes it: lowercase the ASCII letters, then the usual ENS namehash. |
 | `resolve(uint256 tokenId)` on GNS or WNS, for that id | `0x4f896d4f` | `abi.encode(address)`, the address looked up |
+| `stealthMetaAddressOf(address registrant, uint256 schemeId)` on the ERC-6538 registry | `0x7aa8b5ad` | `abi.encode(bytes)`: the registrant's entry for that scheme in the registry the last names lookup brought, or empty bytes |
+| `resolveWithGateways(bytes dnsName, bytes data, string[] gateways)` on the Universal Resolver, where `data` is `text(bytes32 node, string key)` (`0x59d1d43c`) with key `stealth-address-scheme-1` | `0xa1472844` | `abi.encode(bytes result, address resolver)` with `result = abi.encode(string)`: the record for `node` in the list the last names lookup brought, or `""` |
+| `text(uint256 tokenId, string key)` on GNS or WNS, key `stealth-address-scheme-1` | `0x308e3386` | `abi.encode(string)`: the record for `tokenId` (the name's namehash) in the same list, or `""` |
 
 - **One lookup per address, whatever was asked.** Answering every system from
   the same lookup keeps the number of lookups from saying which systems an
   address uses.
+- **The stealth registry and text records need no lookup of their own.**
+  Answer `stealthMetaAddressOf` for any registrant, and the
+  `stealth-address-scheme-1` record of any name a lookup returned, from the
+  lists the last names lookup brought. kohaku-cli asks both for the wallet's
+  first address on every `balances` run until it finds a meta-address (the
+  record first when the address has a name), and for the recipient of a
+  stealth transfer.
+- **A typed name behind a gateway** may have a record the list does not
+  know, since only the records of primary names are asked at gateways. A name
+  in the list is answered from it either way. Pass any other one on.
 - **A name too long for the table** cannot be answered from it. Pass that call
   on to the RPC, which then sees the address, or treat it as no name.
 - **Everything else passes through as before, and still says what it asks.**
   That covers resolving a name the user typed (a send to `vitalik.eth`), text
-  records and avatars (the stealth meta-address record among them), and
-  primary names on other chains (`coinType` other than 60).
+  records and avatars other than `stealth-address-scheme-1`, and primary
+  names on other chains (`coinType` other than 60).
 
 ### Freshness and coverage
 
@@ -568,6 +597,20 @@ these from one names lookup per address, the forward checks included:
   transaction that writes name-contract storage and the addresses named in
   `ReverseClaimed`, `NameForAddrChanged` and `PrimaryNameSet`. A name set long
   ago for an address that never transacts again can be missed until it does.
+- **The stealth registry** is followed through its `StealthMetaAddressSet`
+  events, looked for in every block that changed the registry's state, and
+  each registration they name is read again. The node's logs start where it
+  began syncing, so registrations older than that come from a list
+  (`--names-stealth-registrants`), taken from the registry's events once. The
+  registry's storage on the node confirms the list is whole: 9 registrations
+  account for all 38 of its slots.
+- **Stealth text records** set on chain are found through `TextChanged`
+  events with that key, from any contract, and every name one has touched is
+  read again each step, from the resolver the registry names for it now
+  (GNS and WNS keep their own). Records set before the node's logs come from
+  a list (`--names-stealth-texts`). The records of primary names behind a
+  gateway have no event, so they are asked along with the names, about once
+  an hour.
 
 Serving it:
 
@@ -592,9 +635,13 @@ cargo run --release -p pir-chain --features ethrex-dump \
     --storage-of 0x0000000000696760E15f265e828DB644A0c242EB
 
 # Serve it. The server asks the node about every starting address (about 20
-# minutes on mainnet), then follows the chain, saving its state every 10 minutes:
+# minutes on mainnet), then follows the chain, saving its state every 10 minutes.
+# stealth.txt lists the ERC-6538 registrations, one registrant,scheme_id per line,
+# and texts.txt the names a TextChanged event for stealth-address-scheme-1
+# touched, one node,contract per line:
 cargo run --release -p pir-server -- --names-ens-candidates ens.csv \
     --names-ns-candidates ns.csv --names-state names.state \
+    --names-stealth-registrants stealth.txt --names-stealth-texts texts.txt \
     --buckets 1048576 --eth-rpc http://NODE:8545 --listen 0.0.0.0:8092
 ```
 

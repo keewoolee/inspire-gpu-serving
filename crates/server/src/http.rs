@@ -87,6 +87,8 @@ fn handle(mut req: tiny_http::Request, state: &ServingState) {
                 snapshot_block: gen.snapshot_block,
                 stash: gen.stash.clone(),
                 entries: state.sidecar.since(gen.snapshot_block),
+                stealth_registry: state.stealth_registry.lock().unwrap().clone(),
+                stealth_texts: state.stealth_texts.lock().unwrap().clone(),
             };
             Response::from_string(broadcast.to_json())
                 .with_header(json_header())
@@ -137,6 +139,8 @@ fn handle(mut req: tiny_http::Request, state: &ServingState) {
                 snapshot_block: gen.snapshot_block,
                 stash: gen.stash.clone(),
                 entries: state.sidecar.since(gen.snapshot_block),
+                stealth_registry: state.stealth_registry.lock().unwrap().clone(),
+                stealth_texts: state.stealth_texts.lock().unwrap().clone(),
             };
             let json = broadcast.to_json();
             let mut out =

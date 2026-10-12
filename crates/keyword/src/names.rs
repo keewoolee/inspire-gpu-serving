@@ -19,7 +19,26 @@
 //! addresses with a name hold one that does not fit (measured over 912,609 on
 //! 2026-10-08), mostly `0x<address>.eth` names, which are 46 bytes.
 
+use crate::storage::keccak256;
+
 pub const NAME_VALUE_SIZE: usize = 40;
+
+/// The ENS namehash of a name, which GNS and WNS also use as a name's id.
+/// The name is taken as given: normalizing it (ENSIP-15) is the caller's
+/// part.
+pub fn namehash(name: &str) -> [u8; 32] {
+    let mut node = [0u8; 32];
+    if name.is_empty() {
+        return node;
+    }
+    for label in name.rsplit('.') {
+        let mut input = [0u8; 64];
+        input[..32].copy_from_slice(&node);
+        input[32..].copy_from_slice(&keccak256(label.as_bytes()));
+        node = keccak256(&input);
+    }
+    node
+}
 
 /// Set in a record's system byte when the name did not fit.
 pub const TOO_LONG: u8 = 0x80;
@@ -151,6 +170,21 @@ impl Names {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GNS ids are namehashes: these two are the ids GNS's `TextChanged`
+    /// events carried for the names on mainnet.
+    #[test]
+    fn namehash_matches_gns_ids() {
+        assert_eq!(namehash(""), [0u8; 32]);
+        assert_eq!(
+            hex::encode(namehash("tatsumaki.gwei")),
+            "8f224d39e7a640341fcb23099f85eced686f1c693deb24f61678952f167bade6"
+        );
+        assert_eq!(
+            hex::encode(namehash("addr.reverse")),
+            "91d1777781884d03a6757a803996e38de2a42967fb37eeaca72729271025a9e2"
+        );
+    }
 
     fn name(s: &str) -> Option<NameEntry> {
         Some(NameEntry::Name(s.into()))

@@ -43,6 +43,31 @@ pub const NAME_FOR_ADDR_CHANGED: &str =
     "0x8af7a4c7007a33f680904f3b64733396b730fef22d79555dee29801ca2e479a9";
 pub const PRIMARY_NAME_SET: &str = "0x41f2b80eda6de6f23cab2e867951d054a48d6794db479c1d252bb840a374b62c";
 
+/// The ERC-6538 registry of stealth meta-addresses, at the same address on
+/// every chain it is deployed to.
+pub const STEALTH_REGISTRY: &str = "0x6538e6bf4b0ebd30a8ea093027ac2422ce5d6538";
+/// `StealthMetaAddressSet(address indexed registrant, uint256 indexed
+/// schemeId, bytes stealthMetaAddress)`, emitted for every registration,
+/// including one made on a registrant's behalf.
+pub const STEALTH_META_ADDRESS_SET: &str =
+    "0x4e739a47dfa4fd3cfa92f8fe760cebe125565927e5c422cb28e7aa388a067af9";
+
+/// The ENS registry, which names each node's resolver (and falls back to the
+/// original registry for names never moved).
+pub const ENS_REGISTRY: &str = "0x00000000000c2e074ec69a0dfb2997ba6c7d2e1e";
+/// The text record a wallet reads a name's stealth meta-address from.
+pub const STEALTH_TEXT_KEY: &str = "stealth-address-scheme-1";
+/// `STEALTH_TEXT_KEY` hashed, as the indexed key of a `TextChanged` event.
+pub const STEALTH_TEXT_KEY_HASH: &str =
+    "0xad4a755e4b8727259e0edda436227361a1dbd1ba53330549cc341e2dafe6f39f";
+/// `TextChanged(bytes32 indexed node, string indexed indexedKey, string)`,
+/// from older ENS resolvers and from GNS and WNS.
+pub const TEXT_CHANGED: &str = "0xd8c9334b1a9c2f9da342a0a2b32629c1a229b6445dad78947f674b44444a7550";
+/// `TextChanged(bytes32 indexed node, string indexed indexedKey, string key,
+/// string value)`, from the current ENS public resolver.
+pub const TEXT_CHANGED_WITH_VALUE: &str =
+    "0x448bc014f1536726cf8d54ff3d6481ed3cbc683c2591ca204274009afa09b1a1";
+
 /// Contracts that hold primary-name state: the ENS registries (current and the
 /// original one it falls back to), the reverse registrars and resolvers, the
 /// public resolvers, the name wrapper and .eth registrar and controller, the
@@ -80,6 +105,9 @@ const SEL_REVERSE_RESOLVE: [u8; 4] = [0x9a, 0xf8, 0xb7, 0xaa];
 const SEL_OFFCHAIN_LOOKUP: [u8; 4] = [0x55, 0x6f, 0x18, 0x30];
 const SEL_BATCH_QUERY: [u8; 4] = [0xa7, 0x80, 0xba, 0xb6];
 const SEL_HTTP_ERROR: [u8; 4] = [0x01, 0x80, 0x01, 0x52];
+const SEL_STEALTH_META_ADDRESS_OF: [u8; 4] = [0x7a, 0xa8, 0xb5, 0xad];
+const SEL_TEXT: [u8; 4] = [0x59, 0xd1, 0xd4, 0x3c];
+const SEL_RESOLVER: [u8; 4] = [0x01, 0x78, 0xb8, 0xbf];
 
 /// Asks the Universal Resolver to hand every gateway lookup back to the
 /// caller in one batch, which `call_with_ccip` answers itself. This is what
@@ -246,19 +274,7 @@ pub fn dns_encode(name: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-pub fn namehash(name: &str) -> [u8; 32] {
-    let mut node = [0u8; 32];
-    if name.is_empty() {
-        return node;
-    }
-    for label in name.rsplit('.') {
-        let mut input = [0u8; 64];
-        input[..32].copy_from_slice(&node);
-        input[32..].copy_from_slice(&keccak256(label.as_bytes()));
-        node = keccak256(&input);
-    }
-    node
-}
+pub use pir_keyword::names::namehash;
 
 fn gateways() -> Tok {
     Tok::StringArray(vec![LOCAL_BATCH_GATEWAY.to_string()])
@@ -297,6 +313,39 @@ pub fn find_resolver_call(name: &str) -> Option<Vec<u8>> {
 /// `reverseResolve(address)` on a GNS or WNS name contract.
 pub fn ns_reverse_call(address: &Address) -> Vec<u8> {
     [SEL_REVERSE_RESOLVE.to_vec(), [0u8; 12].to_vec(), address.to_vec()].concat()
+}
+
+/// `stealthMetaAddressOf(address registrant, uint256 schemeId)` on the
+/// ERC-6538 registry.
+pub fn stealth_meta_call(registrant: &Address, scheme_id: u64) -> Vec<u8> {
+    let mut registrant_word = [0u8; 32];
+    registrant_word[12..].copy_from_slice(registrant);
+    [
+        SEL_STEALTH_META_ADDRESS_OF.to_vec(),
+        encode(&[Tok::Word(registrant_word), Tok::Word(word(scheme_id))]),
+    ]
+    .concat()
+}
+
+/// `text(bytes32 node, string key)`, on an ENS resolver or on GNS or WNS.
+pub fn text_call(node: &[u8; 32], key: &str) -> Vec<u8> {
+    [SEL_TEXT.to_vec(), encode(&[Tok::Word(*node), Tok::Bytes(key.as_bytes().to_vec())])].concat()
+}
+
+/// `resolver(bytes32 node)` on the ENS registry.
+pub fn resolver_call(node: &[u8; 32]) -> Vec<u8> {
+    [SEL_RESOLVER.to_vec(), node.to_vec()].concat()
+}
+
+/// The address a function returning `address` first returned.
+pub fn decode_first_address(output: &[u8]) -> Result<Address, String> {
+    Reader(output).address(0)
+}
+
+/// The `bytes` a function returning `bytes` first returned, as
+/// `stealthMetaAddressOf` does.
+pub fn decode_first_bytes(output: &[u8]) -> Result<Vec<u8>, String> {
+    Ok(Reader(output).bytes(0)?.to_vec())
 }
 
 /// The name a `resolveWithGateways(…, name(node), …)` call returned: its
@@ -606,6 +655,32 @@ pub fn call_with_ccip(
 /// The full ENS reverse lookup, gateways included. A gateway that answers
 /// with a client error (4xx other than 429) has answered: viem reads that as
 /// no name, and so does this. A 429, a 5xx or no answer at all says nothing.
+/// A text record behind a gateway.
+pub enum OffchainText {
+    /// The record, empty when the name has none.
+    Value(String),
+    /// A gateway did not answer, so nothing is known.
+    GatewayFailed(String),
+}
+
+/// A name's text record the way viem's `getEnsText` reads it: through the
+/// Universal Resolver, with CCIP-Read for a name behind a gateway. A resolver
+/// that has no such record or refuses the call reads as an empty record, and
+/// so does a gateway's 4xx other than 429, as for names.
+pub fn resolve_text(rpc: &EthRpc, gateway: &Gateway, name: &str, key: &str) -> Result<OffchainText, String> {
+    let Some(dns) = dns_encode(name) else { return Ok(OffchainText::Value(String::new())) };
+    let call = resolve_call(&dns, text_call(&namehash(name), key));
+    let (outcome, failure) = call_with_ccip(rpc, gateway, UNIVERSAL_RESOLVER, call)?;
+    Ok(match (outcome, failure) {
+        (CallOutcome::Output(out), _) => OffchainText::Value(decode_reverse_half(&out).unwrap_or_default()),
+        (_, Some((status, _))) if (400..500).contains(&status) && status != 429 => {
+            OffchainText::Value(String::new())
+        }
+        (_, Some((_, message))) => OffchainText::GatewayFailed(message),
+        (CallOutcome::Reverted(_), None) => OffchainText::Value(String::new()),
+    })
+}
+
 pub fn resolve_offchain(rpc: &EthRpc, gateway: &Gateway, address: &Address) -> Result<EnsOffchain, String> {
     let (outcome, failure) = call_with_ccip(rpc, gateway, UNIVERSAL_RESOLVER, reverse_call(address))?;
     Ok(match (classify_reverse(outcome), failure) {
@@ -666,6 +741,49 @@ mod tests {
             "782d62617463682d676174657761793a74727565000000000000000000000000",
         );
         assert_eq!(hex::encode(data), expected);
+    }
+
+    /// The registry's selector and event topic are what their signatures hash
+    /// to, and the call carries the registrant and scheme as two words.
+    #[test]
+    fn stealth_registry_call_and_event() {
+        assert_eq!(
+            keccak256(b"stealthMetaAddressOf(address,uint256)")[..4],
+            SEL_STEALTH_META_ADDRESS_OF
+        );
+        assert_eq!(
+            hex0x(&keccak256(b"StealthMetaAddressSet(address,uint256,bytes)")),
+            STEALTH_META_ADDRESS_SET
+        );
+        let data = stealth_meta_call(&addr("0x352dcc61b13996af6bfbd47e891f32175af4f355"), 1);
+        assert_eq!(
+            hex::encode(data),
+            concat!(
+                "7aa8b5ad",
+                "000000000000000000000000352dcc61b13996af6bfbd47e891f32175af4f355",
+                "0000000000000000000000000000000000000000000000000000000000000001",
+            )
+        );
+        let meta = vec![0x03u8; 66];
+        assert_eq!(decode_first_bytes(&encode(&[Tok::Bytes(meta.clone())])).unwrap(), meta);
+        assert_eq!(decode_first_bytes(&encode(&[Tok::Bytes(vec![])])).unwrap(), Vec::<u8>::new());
+    }
+
+    /// The text-record constants are what their sources hash to, and a text
+    /// call is the node and the key.
+    #[test]
+    fn stealth_text_constants_and_calls() {
+        assert_eq!(hex0x(&keccak256(STEALTH_TEXT_KEY.as_bytes())), STEALTH_TEXT_KEY_HASH);
+        assert_eq!(hex0x(&keccak256(b"TextChanged(bytes32,string,string)")), TEXT_CHANGED);
+        assert_eq!(hex0x(&keccak256(b"TextChanged(bytes32,string,string,string)")), TEXT_CHANGED_WITH_VALUE);
+        assert_eq!(keccak256(b"text(bytes32,string)")[..4], SEL_TEXT);
+        assert_eq!(keccak256(b"resolver(bytes32)")[..4], SEL_RESOLVER);
+        let node = namehash("luca.gwei");
+        let call = text_call(&node, STEALTH_TEXT_KEY);
+        assert_eq!(&call[..4], &SEL_TEXT);
+        assert_eq!(&call[4..36], &node);
+        assert_eq!(Reader(&call[4..]).bytes(32).unwrap(), STEALTH_TEXT_KEY.as_bytes());
+        assert_eq!(resolver_call(&node).len(), 36);
     }
 
     #[test]

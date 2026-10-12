@@ -113,6 +113,14 @@ fn step_names(
 ) -> Result<usize, String> {
     let changes = tracker.step()?;
     let block = tracker.synced_to;
+    if let Some(list) = tracker.take_stealth_registry() {
+        eprintln!("stealth registry: {} registrations as of block #{block}", list.len());
+        *state.stealth_registry.lock().unwrap() = list;
+    }
+    if let Some(list) = tracker.take_stealth_texts() {
+        eprintln!("stealth texts: {} set records as of block #{block}", list.len());
+        *state.stealth_texts.lock().unwrap() = list;
+    }
     let mut bld = builder.lock().unwrap();
     for c in &changes {
         let key = bld.apply_account(&c.address, &c.value);

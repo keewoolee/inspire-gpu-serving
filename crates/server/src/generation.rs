@@ -15,11 +15,11 @@ use crate::scheduler::{self, QueryJob};
 use crate::sidecar::Sidecar;
 use pir_backend_ffi::{GpuServer, Params};
 use pir_keyword::cuckoo::{canary_value, CuckooTable, CANARY_ADDRESS};
-use pir_keyword::manifest::{CuckooManifest, Manifest, StashEntry};
+use pir_keyword::manifest::{CuckooManifest, Manifest, StashEntry, StealthEntry, StealthText};
 use pir_keyword::slots::{slot_db_cols, to_slot_db, write_bucket_to_slot_db};
 use pir_keyword::storage::storage_key;
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 /// One live generation, shared with the HTTP workers.
@@ -44,6 +44,11 @@ pub struct Generation {
 pub struct ServingState {
     current: RwLock<Arc<Generation>>,
     pub sidecar: Arc<Sidecar>,
+    /// The ERC-6538 registry, whole, as a name server's follower last read
+    /// it. Sent with every broadcast; empty on other servers.
+    pub stealth_registry: Mutex<Vec<StealthEntry>>,
+    /// Every set `stealth-address-scheme-1` text record, likewise.
+    pub stealth_texts: Mutex<Vec<StealthText>>,
 }
 
 impl ServingState {
@@ -51,6 +56,8 @@ impl ServingState {
         ServingState {
             current: RwLock::new(Arc::new(first)),
             sidecar,
+            stealth_registry: Mutex::new(Vec::new()),
+            stealth_texts: Mutex::new(Vec::new()),
         }
     }
 

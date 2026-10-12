@@ -29,23 +29,43 @@
 //! names expire with time, and an ENS name whose forward record lives behind
 //! a gateway can change there.
 //!
+//! The tracker also follows the ERC-6538 registry of stealth meta-addresses,
+//! which a wallet reads for an address alongside its names. It holds a
+//! handful of registrations, so it is sent whole with every broadcast rather
+//! than looked up. A block that changed the registry's state is searched for
+//! `StealthMetaAddressSet` events, and each registration they name is read
+//! again. Registrations older than the node's logs come from a starting list.
+//!
+//! A wallet with a name reads that name's `stealth-address-scheme-1` text
+//! record first, so those are followed too and sent whole the same way. An
+//! on-chain record is found through `TextChanged` events with that key, from
+//! any contract, and the names they touch are read again every step. A record
+//! behind a gateway has no event, so the primary names behind a gateway have
+//! theirs asked along with the names, about once an hour.
+//!
 //! Asking about the whole starting set takes many node calls, so they go out
 //! as several batches at once, and the tracker saves its state to a file now
 //! and then. A restart loads the file and follows on from where it stopped,
 //! as long as the node can still trace the next block.
 
 use pir_chain::names::{
-    access_list_request, addresses_in_word, call_request, classify_reverse, decode_first_string,
-    decode_reverse_half, find_resolver_call, forward_half_call, ns_reverse_call, parse_access_list,
-    parse_address, parse_call, resolve_offchain, reverse_call, reverse_half_call, reverse_name,
-    Address, CallOutcome, EnsOffchain, EnsOnchain, Gateway, Read, ENS_DEFAULT_REVERSE_REGISTRAR,
-    ENS_REVERSE_REGISTRAR, GNS, KNOWN_CONTRACTS, NAME_FOR_ADDR_CHANGED, PRIMARY_NAME_SET,
-    REVERSE_CLAIMED, UNIVERSAL_RESOLVER, WNS,
+    access_list_request, addresses_in_word, call_request, classify_reverse, decode_first_bytes,
+    decode_first_string, decode_reverse_half, find_resolver_call, forward_half_call,
+    ns_reverse_call, parse_access_list, parse_address, parse_call, resolve_offchain, reverse_call,
+    reverse_half_call, reverse_name, stealth_meta_call, Address, CallOutcome, EnsOffchain,
+    EnsOnchain, Gateway, Read, ENS_DEFAULT_REVERSE_REGISTRAR, ENS_REVERSE_REGISTRAR, GNS,
+    KNOWN_CONTRACTS, NAME_FOR_ADDR_CHANGED, PRIMARY_NAME_SET, REVERSE_CLAIMED,
+    STEALTH_META_ADDRESS_SET, STEALTH_REGISTRY, UNIVERSAL_RESOLVER, WNS,
+};
+use pir_chain::names::{
+    decode_first_address, namehash, resolve_text, resolver_call, text_call, OffchainText,
+    ENS_REGISTRY, STEALTH_TEXT_KEY, STEALTH_TEXT_KEY_HASH, TEXT_CHANGED, TEXT_CHANGED_WITH_VALUE,
 };
 use pir_chain::rpc::EthRpc;
+use pir_keyword::manifest::{StealthEntry, StealthText};
 use pir_keyword::names::{NameEntry, Names};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Read as _, Write};
 use std::path::{Path, PathBuf};
@@ -64,8 +84,10 @@ const BULK_ROUNDS: usize = 4;
 const OFFCHAIN_BUDGET: Duration = Duration::from_secs(3);
 /// Gateway lookups per second, at least. Most offchain names sit behind one
 /// gateway (Coinbase's), which answers a burst with 429, so lookups are paced
-/// rather than sent all at once.
-const MIN_OFFCHAIN_RATE: f64 = 3.0;
+/// rather than sent all at once. Each lookup asks the gateway twice, for the
+/// name and for its stealth text record, and 2 a second still takes the
+/// 6,641 gateway-backed names of mainnet round in under an hour.
+const MIN_OFFCHAIN_RATE: f64 = 2.0;
 /// Gateway lookups in flight at once.
 const OFFCHAIN_WORKERS: usize = 4;
 
@@ -123,6 +145,56 @@ pub fn read_candidates(path: &Path, strict: bool) -> io::Result<Vec<Address>> {
     let mut out: Vec<Address> = out.into_iter().collect();
     out.sort();
     Ok(out)
+}
+
+/// Read the names to start following `stealth-address-scheme-1` records for:
+/// one per line, `node,contract`, the node a `TextChanged` event named and
+/// the contract that emitted it. Lines starting with `#` are comments.
+pub fn read_stealth_texts(path: &Path) -> io::Result<Vec<([u8; 32], Address)>> {
+    let mut out = BTreeMap::new();
+    for (i, line) in BufReader::new(File::open(path)?).lines().enumerate() {
+        let line = line?;
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let parsed = line.split_once(',').and_then(|(node, contract)| {
+            let node = hex::decode(node.trim().trim_start_matches("0x")).ok()?.try_into().ok()?;
+            Some((node, parse_address(contract.trim())?))
+        });
+        let Some((node, contract)) = parsed else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{}:{}: not a node and contract: {line:?}", path.display(), i + 1),
+            ));
+        };
+        out.insert(node, contract);
+    }
+    Ok(out.into_iter().collect())
+}
+
+/// Read the registrations to start the stealth registry from: one per line,
+/// `registrant,scheme_id`, or a registrant alone for scheme 1. Lines starting
+/// with `#` are comments.
+pub fn read_stealth_registrants(path: &Path) -> io::Result<Vec<(Address, u64)>> {
+    let mut out = BTreeSet::new();
+    for (i, line) in BufReader::new(File::open(path)?).lines().enumerate() {
+        let line = line?;
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (registrant, scheme) = line.split_once(',').unwrap_or((line, "1"));
+        let parsed = parse_address(registrant.trim()).zip(scheme.trim().parse::<u64>().ok());
+        let Some(entry) = parsed else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{}:{}: not a registrant and scheme: {line:?}", path.display(), i + 1),
+            ));
+        };
+        out.insert(entry);
+    }
+    Ok(out.into_iter().collect())
 }
 
 #[derive(Clone, Copy)]
@@ -188,6 +260,26 @@ pub struct NamesTracker {
     bulk: VecDeque<Job>,
     last_log: Instant,
     last_save: Instant,
+
+    /// The ERC-6538 registry: every non-empty registration, by registrant
+    /// and scheme.
+    stealth: BTreeMap<(Address, u64), Vec<u8>>,
+    /// Registrations to read again, from the starting list or an event.
+    stealth_pending: BTreeSet<(Address, u64)>,
+    /// Whether `stealth` changed since the follower last took it.
+    stealth_dirty: bool,
+    stealth_registry: Address,
+
+    /// Names a `TextChanged` event for the stealth key has touched, by node,
+    /// with the contract that emitted it.
+    text_watch: BTreeMap<[u8; 32], Address>,
+    /// Their records as last read, the set ones only.
+    texts_onchain: BTreeMap<[u8; 32], String>,
+    /// The record of each gateway-backed address's ENS name, when set: the
+    /// name's node and the record.
+    texts_offchain: HashMap<Address, ([u8; 32], String)>,
+    /// The text list as last handed to the follower.
+    texts_published: Vec<StealthText>,
 }
 
 impl NamesTracker {
@@ -224,6 +316,14 @@ impl NamesTracker {
             bulk: VecDeque::new(),
             last_log: Instant::now(),
             last_save: Instant::now(),
+            stealth: BTreeMap::new(),
+            stealth_pending: BTreeSet::new(),
+            stealth_dirty: true,
+            stealth_registry: parse(STEALTH_REGISTRY),
+            text_watch: BTreeMap::new(),
+            texts_onchain: BTreeMap::new(),
+            texts_offchain: HashMap::new(),
+            texts_published: Vec::new(),
         }
     }
 
@@ -251,6 +351,63 @@ impl NamesTracker {
         t
     }
 
+    /// Registrations to read at the next step, unless already held. The
+    /// node's logs start where it began syncing, so registrations made before
+    /// that are known only from a list like this.
+    pub fn watch_stealth_registrants(&mut self, registrations: impl IntoIterator<Item = (Address, u64)>) {
+        for r in registrations {
+            if !self.stealth.contains_key(&r) {
+                self.stealth_pending.insert(r);
+            }
+        }
+    }
+
+    /// Names to follow the stealth text record of, from a list. The node's
+    /// logs start where it began syncing, so a record set before that is
+    /// known only from a list like this.
+    pub fn watch_stealth_texts(&mut self, names: impl IntoIterator<Item = ([u8; 32], Address)>) {
+        self.text_watch.extend(names);
+    }
+
+    /// Every set stealth text record, sorted by node, when the list changed
+    /// since the last call. A gateway-backed record counts only while its
+    /// address is still behind a gateway.
+    pub fn take_stealth_texts(&mut self) -> Option<Vec<StealthText>> {
+        let mut by_node: BTreeMap<[u8; 32], &String> = BTreeMap::new();
+        for (address, (node, value)) in &self.texts_offchain {
+            if self.offchain.contains(address) {
+                by_node.insert(*node, value);
+            }
+        }
+        by_node.extend(self.texts_onchain.iter().map(|(n, v)| (*n, v)));
+        let list: Vec<StealthText> = by_node
+            .into_iter()
+            .map(|(node, value)| StealthText { node: format!("0x{}", hex::encode(node)), value: value.clone() })
+            .collect();
+        if list == self.texts_published {
+            return None;
+        }
+        self.texts_published = list.clone();
+        Some(list)
+    }
+
+    /// The whole registry, sorted, when it changed since the last call.
+    pub fn take_stealth_registry(&mut self) -> Option<Vec<StealthEntry>> {
+        if !std::mem::take(&mut self.stealth_dirty) {
+            return None;
+        }
+        Some(
+            self.stealth
+                .iter()
+                .map(|((registrant, scheme_id), meta)| StealthEntry {
+                    registrant: format!("0x{}", hex::encode(registrant)),
+                    scheme_id: *scheme_id,
+                    meta: format!("0x{}", hex::encode(meta)),
+                })
+                .collect(),
+        )
+    }
+
     /// Whether the starting set has been asked in full. Gateway answers may
     /// still be arriving.
     pub fn starting_set_done(&self) -> bool {
@@ -270,7 +427,8 @@ impl NamesTracker {
         let why = if why.is_empty() { String::new() } else { format!(" [{}]", why.join("; ")) };
         format!(
             "block #{}: {} addresses named (ENS {}, GNS {}, WNS {}), {} indexed over {} reads, \
-             {} behind gateways ({} queued, {} gateway failures{}), {} addresses seen, queues: {} urgent, {} fresh, {} starting",
+             {} behind gateways ({} queued, {} gateway failures{}), {} addresses seen, queues: {} urgent, {} fresh, {} starting; \
+             {} stealth meta-addresses, {} stealth text records ({} names watched)",
             self.synced_to,
             self.names.len(),
             count(|n| n.ens.is_some()),
@@ -286,6 +444,9 @@ impl NamesTracker {
             self.urgent.len(),
             self.fresh.len(),
             self.bulk.len(),
+            self.stealth.len(),
+            self.texts_onchain.len() + self.texts_offchain.len(),
+            self.text_watch.len(),
         )
     }
 
@@ -300,6 +461,8 @@ impl NamesTracker {
             self.ingest_block(self.synced_to + 1)?;
             self.synced_to += 1;
         }
+        self.read_stealth()?;
+        self.read_texts()?;
 
         let round = self.cfg.concurrency.max(1) * BATCH;
         let mut changes = Vec::new();
@@ -422,6 +585,35 @@ impl NamesTracker {
             (GNS, PRIMARY_NAME_SET, true),
             (WNS, PRIMARY_NAME_SET, true),
         ];
+        if diffs.iter().any(|d| d.accounts.contains(&self.stealth_registry)) {
+            for log in self.rpc.get_logs(block, STEALTH_REGISTRY, STEALTH_META_ADDRESS_SET)? {
+                let topic = |i: usize| log.get("topics").and_then(|t| t.get(i)).and_then(Value::as_str);
+                let registrant = topic(1).and_then(|t| parse_address(&format!("0x{}", &t[t.len().saturating_sub(40)..])));
+                let scheme = topic(2).and_then(|t| u64::from_str_radix(t.trim_start_matches("0x"), 16).ok());
+                match (registrant, scheme) {
+                    (Some(r), Some(s)) => {
+                        self.stealth_pending.insert((r, s));
+                    }
+                    _ => eprintln!("stealth registry: skipping an event at block #{block} it cannot read: {log}"),
+                }
+            }
+        }
+        let topics = serde_json::json!([[TEXT_CHANGED, TEXT_CHANGED_WITH_VALUE], null, STEALTH_TEXT_KEY_HASH]);
+        for log in self.rpc.get_logs_matching(block, topics)? {
+            let node = log
+                .get("topics")
+                .and_then(|t| t.get(1))
+                .and_then(Value::as_str)
+                .and_then(|t| hex::decode(t.trim_start_matches("0x")).ok())
+                .and_then(|b| <[u8; 32]>::try_from(b).ok());
+            let contract = log.get("address").and_then(Value::as_str).and_then(parse_address);
+            match (node, contract) {
+                (Some(node), Some(contract)) => {
+                    self.text_watch.insert(node, contract);
+                }
+                _ => eprintln!("stealth texts: skipping an event at block #{block} it cannot read: {log}"),
+            }
+        }
         for (contract, topic, ns) in events {
             for log in self.rpc.get_logs(block, contract, topic)? {
                 let Some(address) = log
@@ -440,6 +632,87 @@ impl NamesTracker {
         }
 
         self.check_expiry()
+    }
+
+    /// Read every pending registration from the node. An empty one is
+    /// dropped, since it reads the same as none.
+    pub fn read_stealth(&mut self) -> Result<(), String> {
+        let pending: Vec<(Address, u64)> = self.stealth_pending.iter().copied().collect();
+        for chunk in pending.chunks(BATCH) {
+            let reqs: Vec<_> = chunk
+                .iter()
+                .map(|(registrant, scheme)| call_request(STEALTH_REGISTRY, &stealth_meta_call(registrant, *scheme)))
+                .collect();
+            for (key, item) in chunk.iter().zip(self.rpc.batch_raw(&reqs)?) {
+                let meta = match parse_call(item)? {
+                    CallOutcome::Output(out) => decode_first_bytes(&out)?,
+                    CallOutcome::Reverted(_) => {
+                        return Err(format!("stealthMetaAddressOf(0x{}, {}) reverted", hex::encode(key.0), key.1))
+                    }
+                };
+                if self.stealth.get(key).map(Vec::as_slice).unwrap_or_default() != meta.as_slice() {
+                    let shown = if meta.is_empty() { "none".to_string() } else { format!("0x{}", hex::encode(&meta)) };
+                    eprintln!("stealth registry: 0x{} scheme {} -> {shown}", hex::encode(key.0), key.1);
+                    if meta.is_empty() {
+                        self.stealth.remove(key);
+                    } else {
+                        self.stealth.insert(*key, meta);
+                    }
+                    self.stealth_dirty = true;
+                }
+                self.stealth_pending.remove(key);
+            }
+        }
+        Ok(())
+    }
+
+    /// Read the stealth text record of every watched name. GNS and WNS keep
+    /// records themselves; an ENS name's sit in whichever resolver the
+    /// registry names now, which need not be the one that emitted the event.
+    /// A resolver that has no such record or refuses the call reads as none.
+    pub fn read_texts(&mut self) -> Result<(), String> {
+        if self.text_watch.is_empty() {
+            return Ok(());
+        }
+        let watched: Vec<([u8; 32], Address)> = self.text_watch.iter().map(|(n, c)| (*n, *c)).collect();
+        let ens: Vec<[u8; 32]> = watched
+            .iter()
+            .filter(|(_, c)| !self.ns_contracts.contains(c))
+            .map(|(n, _)| *n)
+            .collect();
+        let reqs: Vec<_> = ens.iter().map(|n| call_request(ENS_REGISTRY, &resolver_call(n))).collect();
+        let mut resolver_of: HashMap<[u8; 32], Address> = HashMap::new();
+        for (node, item) in ens.iter().zip(self.rpc.batch_raw(&reqs)?) {
+            if let CallOutcome::Output(out) = parse_call(item)? {
+                resolver_of.insert(*node, decode_first_address(&out)?);
+            }
+        }
+        let mut asked = Vec::new();
+        let mut reqs = Vec::new();
+        for (node, contract) in &watched {
+            let target = if self.ns_contracts.contains(contract) { Some(*contract) } else { resolver_of.get(node).copied() };
+            match target.filter(|t| *t != [0u8; 20]) {
+                Some(t) => {
+                    asked.push(*node);
+                    reqs.push(call_request(&format!("0x{}", hex::encode(t)), &text_call(node, STEALTH_TEXT_KEY)));
+                }
+                None => {
+                    self.texts_onchain.remove(node);
+                }
+            }
+        }
+        for (node, item) in asked.iter().zip(self.rpc.batch_raw(&reqs)?) {
+            let value = match parse_call(item)? {
+                CallOutcome::Output(out) => decode_first_string(&out).unwrap_or_default(),
+                CallOutcome::Reverted(_) => String::new(),
+            };
+            if value.is_empty() {
+                self.texts_onchain.remove(node);
+            } else {
+                self.texts_onchain.insert(*node, value);
+            }
+        }
+        Ok(())
     }
 
     /// GNS and WNS names lapse with time and no event, so the addresses
@@ -548,14 +821,25 @@ impl NamesTracker {
         let deadline = now + OFFCHAIN_BUDGET;
         let queue = Mutex::new(work);
         let (rpc, gateway) = (&self.rpc, &self.gateway);
-        let results: Vec<(Address, Result<EnsOffchain, String>)> = std::thread::scope(|s| {
+        type Text = Option<Result<([u8; 32], OffchainText), String>>;
+        let results: Vec<(Address, Result<EnsOffchain, String>, Text)> = std::thread::scope(|s| {
             let handles: Vec<_> = (0..self.cfg.concurrency.clamp(1, OFFCHAIN_WORKERS))
                 .map(|_| {
                     s.spawn(|| {
                         let mut done = Vec::new();
                         while Instant::now() < deadline {
                             let Some(address) = queue.lock().unwrap().pop_front() else { break };
-                            done.push((address, resolve_offchain(rpc, gateway, &address)));
+                            let found = resolve_offchain(rpc, gateway, &address);
+                            // The name's stealth text record, which also sits
+                            // behind the gateway and has no event either.
+                            let text = match &found {
+                                Ok(EnsOffchain::Name(name)) => Some(
+                                    resolve_text(rpc, gateway, name, STEALTH_TEXT_KEY)
+                                        .map(|t| (namehash(name), t)),
+                                ),
+                                _ => None,
+                            };
+                            done.push((address, found, text));
                         }
                         done
                     })
@@ -572,9 +856,29 @@ impl NamesTracker {
 
         let mut changes = Vec::new();
         let mut first_error = None;
-        for (address, result) in results {
+        for (address, result, text) in results {
             if self.offchain.contains(&address) && self.offchain_queued.insert(address) {
                 self.offchain_queue.push_back(address);
+            }
+            match text {
+                Some(Ok((node, OffchainText::Value(value)))) if !value.is_empty() => {
+                    self.texts_offchain.insert(address, (node, value));
+                }
+                Some(Ok((_, OffchainText::Value(_)))) => {
+                    self.texts_offchain.remove(&address);
+                }
+                Some(Ok((_, OffchainText::GatewayFailed(why)))) => {
+                    self.gateway_failures += 1;
+                    *self.failures_by.entry(why).or_insert(0) += 1;
+                }
+                Some(Err(e)) => {
+                    first_error.get_or_insert(e);
+                }
+                None => {
+                    if matches!(result, Ok(EnsOffchain::NoName)) {
+                        self.texts_offchain.remove(&address);
+                    }
+                }
             }
             let ens = match result {
                 Ok(EnsOffchain::Name(n)) => Some(NameEntry::Name(n)),
@@ -750,6 +1054,30 @@ impl NamesTracker {
             w.u8(j.ns as u8)?;
         }
         w.addresses(self.offchain_queue.iter())?;
+        w.u32(self.stealth.len() as u32)?;
+        for ((registrant, scheme), meta) in &self.stealth {
+            w.bytes(registrant)?;
+            w.u64(*scheme)?;
+            w.u32(meta.len() as u32)?;
+            w.bytes(meta)?;
+        }
+        w.u32(self.stealth_pending.len() as u32)?;
+        for (registrant, scheme) in &self.stealth_pending {
+            w.bytes(registrant)?;
+            w.u64(*scheme)?;
+        }
+        w.u32(self.text_watch.len() as u32)?;
+        for (node, contract) in &self.text_watch {
+            w.bytes(node)?;
+            w.bytes(contract)?;
+        }
+        w.u32(self.texts_offchain.len() as u32)?;
+        for (address, (node, value)) in &self.texts_offchain {
+            w.bytes(address)?;
+            w.bytes(node)?;
+            w.u32(value.len() as u32)?;
+            w.bytes(value.as_bytes())?;
+        }
         w.0.flush()?;
         Ok(w.1)
     }
@@ -823,6 +1151,32 @@ impl NamesTracker {
         for a in r.addresses()? {
             if t.offchain_queued.insert(a) {
                 t.offchain_queue.push_back(a);
+            }
+        }
+        // A state may end before the stealth registry, or before the stealth
+        // text records.
+        if let Some(held) = r.u32_or_end()? {
+            for _ in 0..held {
+                let key = (r.address()?, r.u64()?);
+                let mut meta = vec![0u8; r.u32()? as usize];
+                r.0.read_exact(&mut meta)?;
+                t.stealth.insert(key, meta);
+            }
+            for _ in 0..r.u32()? {
+                t.stealth_pending.insert((r.address()?, r.u64()?));
+            }
+            if let Some(watched) = r.u32_or_end()? {
+                for _ in 0..watched {
+                    let node = r.array::<32>()?;
+                    t.text_watch.insert(node, r.address()?);
+                }
+                for _ in 0..r.u32()? {
+                    let address = r.address()?;
+                    let node = r.array::<32>()?;
+                    let mut value = vec![0u8; r.u32()? as usize];
+                    r.0.read_exact(&mut value)?;
+                    t.texts_offchain.insert(address, (node, String::from_utf8_lossy(&value).into_owned()));
+                }
             }
         }
         // Every offchain address keeps coming round, in case the save caught
@@ -1036,6 +1390,15 @@ impl In {
     fn u64(&mut self) -> io::Result<u64> {
         Ok(u64::from_le_bytes(self.array()?))
     }
+    /// A count, or `None` at the end of the file, for a section a state
+    /// may end before.
+    fn u32_or_end(&mut self) -> io::Result<Option<u32>> {
+        match self.u32() {
+            Ok(n) => Ok(Some(n)),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
     fn address(&mut self) -> io::Result<Address> {
         self.array()
     }
@@ -1077,6 +1440,10 @@ mod tests {
         t.ns_named.insert(c);
         t.push_urgent(b, true);
         t.fresh.push_back([4u8; 20]);
+        t.stealth.insert((a, 1), vec![0x02; 66]);
+        t.stealth_pending.insert((b, 1));
+        t.text_watch.insert([7u8; 32], c);
+        t.texts_offchain.insert(b, ([8u8; 32], "st:eth:0x02".into()));
 
         let path = std::env::temp_dir().join(format!("names-state-test-{}", std::process::id()));
         t.save(&path).unwrap();
@@ -1100,6 +1467,91 @@ mod tests {
         assert_eq!(u.fresh, t.fresh);
         assert_eq!(u.bulk.len(), t.bulk.len());
         assert_eq!(u.offchain_queue, VecDeque::from([c, b]));
+        assert_eq!(u.stealth, t.stealth);
+        assert_eq!(u.stealth_pending, t.stealth_pending);
+        assert_eq!(u.text_watch, t.text_watch);
+        assert_eq!(u.texts_offchain, t.texts_offchain);
+    }
+
+    /// A state that ends before the stealth registry loads with none, and the
+    /// starting list then queues every registration.
+    #[test]
+    fn a_state_without_the_registry_loads() {
+        let mut t = NamesTracker::new("http://127.0.0.1:1", 100, vec![[1u8; 20]], vec![], cfg());
+        t.set_names([1u8; 20], Names { ens: name("alice.eth"), ..Default::default() });
+        let path = std::env::temp_dir().join(format!("names-state-old-{}", std::process::id()));
+        t.save(&path).unwrap();
+        // Cut the two text counts, then the two registry counts, off the end.
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &bytes[..bytes.len() - 8]).unwrap();
+        let without_texts = NamesTracker::load(&path, "http://127.0.0.1:1", cfg()).unwrap();
+        assert!(without_texts.text_watch.is_empty() && without_texts.texts_offchain.is_empty());
+        std::fs::write(&path, &bytes[..bytes.len() - 16]).unwrap();
+        let mut u = NamesTracker::load(&path, "http://127.0.0.1:1", cfg()).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(u.names, t.names);
+        assert!(u.stealth.is_empty() && u.stealth_pending.is_empty());
+
+        u.stealth.insert(([5u8; 20], 1), vec![0x03; 66]);
+        u.watch_stealth_registrants([([5u8; 20], 1), ([6u8; 20], 1)]);
+        assert_eq!(u.stealth_pending, BTreeSet::from([([6u8; 20], 1)]));
+        let list = u.take_stealth_registry().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].registrant, format!("0x{}", hex::encode([5u8; 20])));
+        assert!(u.take_stealth_registry().is_none(), "unchanged since the last take");
+    }
+
+    /// The text list joins on-chain records with gateway-backed ones, drops a
+    /// gateway-backed one once its address no longer goes through a gateway,
+    /// and is handed over only when it changed.
+    #[test]
+    fn stealth_text_list() {
+        let mut t = NamesTracker::new("http://127.0.0.1:1", 0, vec![], vec![], cfg());
+        assert!(t.take_stealth_texts().is_none(), "nothing to publish yet");
+        let (a, b) = ([1u8; 20], [2u8; 20]);
+        t.texts_onchain.insert([9u8; 32], "st:eth:0x09".into());
+        t.offchain.insert(a);
+        t.texts_offchain.insert(a, ([3u8; 32], "st:eth:0x03".into()));
+        t.texts_offchain.insert(b, ([4u8; 32], "st:eth:0x04".into()));
+        let list = t.take_stealth_texts().unwrap();
+        let nodes: Vec<&str> = list.iter().map(|e| e.node.as_str()).collect();
+        assert_eq!(nodes, vec![format!("0x{}", hex::encode([3u8; 32])), format!("0x{}", hex::encode([9u8; 32]))]);
+        assert!(t.take_stealth_texts().is_none(), "unchanged since the last take");
+        t.offchain.remove(&a);
+        assert_eq!(t.take_stealth_texts().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn stealth_texts_file() {
+        let path = std::env::temp_dir().join(format!("stealth-texts-{}", std::process::id()));
+        std::fs::write(
+            &path,
+            "# node,contract\n0x8f224d39e7a640341fcb23099f85eced686f1c693deb24f61678952f167bade6,0x9d51d507bc7264d4fe8ad1cf7fe191933a0a81d6\n",
+        )
+        .unwrap();
+        let read = read_stealth_texts(&path).unwrap();
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].0, namehash("tatsumaki.gwei"));
+        std::fs::write(&path, "0x8f22,0x9d51d507bc7264d4fe8ad1cf7fe191933a0a81d6\n").unwrap();
+        assert!(read_stealth_texts(&path).is_err());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn stealth_registrants_file() {
+        let path = std::env::temp_dir().join(format!("stealth-registrants-{}", std::process::id()));
+        std::fs::write(
+            &path,
+            "# from StealthMetaAddressSet events\n0x352dcc61b13996af6bfbd47e891f32175af4f355\n\
+             0x06c00f7a1cf3fba6508fbaedee7c2173fda7fbea,1\n0x06c00f7a1cf3fba6508fbaedee7c2173fda7fbea,2\n",
+        )
+        .unwrap();
+        let read = read_stealth_registrants(&path).unwrap();
+        assert_eq!(read.len(), 3);
+        assert!(read.contains(&(parse_address("0x352dcc61b13996af6bfbd47e891f32175af4f355").unwrap(), 1)));
+        std::fs::write(&path, "0x1234,1\n").unwrap();
+        assert!(read_stealth_registrants(&path).is_err());
+        std::fs::remove_file(&path).unwrap();
     }
 
     /// Re-indexing an address drops it from the readers of what it no longer

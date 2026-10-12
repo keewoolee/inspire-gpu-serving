@@ -37,7 +37,8 @@ enum Cmd {
     /// Look up an address's balances of every token a storage server holds
     /// (USDC, USDT, DAI, WETH), always all of them.
     Tokens { holder: String },
-    /// Look up an address's ENS, GNS and WNS primary names (a name server).
+    /// Look up an address's ENS, GNS and WNS primary names, and its stealth
+    /// meta-address from the ERC-6538 registry (a name server).
     Names { address: String },
 }
 
@@ -94,11 +95,26 @@ fn main() {
             let ms = t0.elapsed().as_secs_f64() * 1e3;
             for system in NameSystem::ALL {
                 let shown = match found.names.get(system) {
-                    Some(NameEntry::Name(n)) => n.clone(),
+                    Some(NameEntry::Name(n)) => {
+                        // Its stealth text record came with the lookup too.
+                        let text = client.stealth_text_of(n).unwrap_or_else(die);
+                        if text.is_empty() {
+                            n.clone()
+                        } else {
+                            format!("{n}  (stealth-address-scheme-1: {text})")
+                        }
+                    }
                     Some(NameEntry::TooLong) => "(a name too long for the table)".into(),
                     None => "-".into(),
                 };
                 println!("{:<4} {}", system.label(), shown);
+            }
+            // The registry came whole with the lookup, so this asks nothing more.
+            let meta = client.stealth_meta_address_of(&address, 1).unwrap_or_else(die);
+            if meta.is_empty() {
+                println!("stealth meta-address (ERC-6538, scheme 1): -");
+            } else {
+                println!("stealth meta-address (ERC-6538, scheme 1): 0x{}", hex::encode(meta));
             }
             match found.source {
                 Some(Source::Snapshot { block }) => println!("source: PIR (snapshot block #{block}), {ms:.0} ms"),

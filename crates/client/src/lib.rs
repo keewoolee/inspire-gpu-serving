@@ -26,8 +26,8 @@
 
 use pir_backend_ffi::{pack_query, ClientQuery, Params};
 use pir_keyword::cuckoo::{CuckooHash, CANARY_ADDRESS};
-use pir_keyword::manifest::{KeyDerivation, Manifest, SidecarBroadcast};
-use pir_keyword::names::Names;
+use pir_keyword::manifest::{KeyDerivation, Manifest, SidecarBroadcast, StealthEntry, StealthText};
+use pir_keyword::names::{namehash, Names};
 use pir_keyword::slots::unpack_bytes;
 use pir_keyword::storage::{mapping_slot, parse_storage_value, storage_key};
 
@@ -150,6 +150,12 @@ pub struct PirClient {
     hasher: CuckooHash,
     /// Snapshot block of the last completed lookup (display/monitoring).
     pub last_snapshot_block: u64,
+    /// The whole ERC-6538 stealth registry, as the last lookup against a name
+    /// server brought it. See `stealth_meta_address_of`.
+    pub stealth_registry: Vec<StealthEntry>,
+    /// Every set `stealth-address-scheme-1` text record, likewise. See
+    /// `stealth_text_of`.
+    pub stealth_texts: Vec<StealthText>,
 }
 
 impl PirClient {
@@ -164,7 +170,48 @@ impl PirClient {
             params,
             hasher,
             last_snapshot_block: 0,
+            stealth_registry: Vec::new(),
+            stealth_texts: Vec::new(),
         })
+    }
+
+    /// A name's `stealth-address-scheme-1` text record, from the list the
+    /// last names lookup brought, empty for none. `name` is normalized as
+    /// for any ENS call. The list holds every on-chain record and those of
+    /// the primary names behind a gateway, so the answer holds for a name an
+    /// address lookup returned. Another name behind a gateway may have a
+    /// record the list does not know.
+    pub fn stealth_text_of(&self, name: &str) -> Result<String, String> {
+        if self.manifest.cuckoo.content != "names" {
+            return Err("only a name server sends stealth text records".into());
+        }
+        let node = format!("0x{}", hex::encode(namehash(name)));
+        Ok(self
+            .stealth_texts
+            .iter()
+            .find(|t| t.node == node)
+            .map(|t| t.value.clone())
+            .unwrap_or_default())
+    }
+
+    /// What `stealthMetaAddressOf(registrant, scheme_id)` on the ERC-6538
+    /// registry returns, from the registry the last names lookup brought:
+    /// the registered bytes, empty for none. Every lookup brings the whole
+    /// registry, so answering for any registrant, the user's own or a
+    /// recipient's, says nothing about which one was asked.
+    pub fn stealth_meta_address_of(&self, registrant: &[u8; 20], scheme_id: u64) -> Result<Vec<u8>, String> {
+        if self.manifest.cuckoo.content != "names" {
+            return Err("only a name server sends the stealth registry".into());
+        }
+        let wanted = format!("0x{}", hex::encode(registrant));
+        match self
+            .stealth_registry
+            .iter()
+            .find(|e| e.scheme_id == scheme_id && e.registrant.eq_ignore_ascii_case(&wanted))
+        {
+            Some(e) => hex::decode(e.meta.trim_start_matches("0x")).map_err(|e| e.to_string()),
+            None => Ok(Vec::new()),
+        }
     }
 
     fn fetch_manifest(base: &str) -> Result<(Manifest, Params, CuckooHash), String> {
@@ -357,6 +404,8 @@ impl PirClient {
         let b1 = unpack_bytes(&q1.extract_compressed(&self.params, r1)?, bucket_bytes);
 
         self.last_snapshot_block = sc.snapshot_block;
+        self.stealth_registry = sc.stealth_registry.clone();
+        self.stealth_texts = sc.stealth_texts.clone();
 
         // Pick locally: freshest sidecar entry, else either bucket's
         // matching cell, else the stash — all describing one snapshot.

@@ -153,10 +153,16 @@ impl EthRpc {
         self.call("eth_getBlockByNumber", json!([hex, true]))
     }
 
-    /// Extract all unique addresses touched by a block (from, to, miner/coinbase).
+    /// Extract all unique addresses touched by a block (from, to,
+    /// miner/coinbase, and the accounts its withdrawals credit).
     pub fn addresses_from_block(block: &Value) -> Vec<Vec<u8>> {
         let mut seen = HashSet::new();
         let mut addrs = Vec::new();
+        for address in withdrawal_addresses_of(block) {
+            if seen.insert(address.clone()) {
+                addrs.push(address);
+            }
+        }
 
         // Miner/coinbase
         if let Some(miner) = block.get("miner").and_then(|v| v.as_str()) {
@@ -241,10 +247,15 @@ impl EthRpc {
 
     /// Fetch a block's account changes from a `prestateTracer` state diff.
     ///
-    /// The diff names every account the EVM changed, so it catches value moved
-    /// inside a contract call and credited by a withdrawal, neither of which
-    /// appears in a transaction's `from` or `to`. It also carries the new
-    /// balance and nonce, so no follow-up reads are needed.
+    /// The diff names every account a transaction changed, so it catches
+    /// value moved inside a contract call, which appears in no transaction's
+    /// `from` or `to`, and it carries the new balance and nonce.
+    ///
+    /// Beacon-chain withdrawals are the exception. EIP-4895 credits them after
+    /// the last transaction, outside any of them, so no diff shows them, and
+    /// on mainnet every withdrawal address of a block was missing from its
+    /// diffs. The block lists them, so their accounts are read at the block,
+    /// which also covers one that a transaction changed earlier in it.
     ///
     /// `post` holds only the fields that changed, so an account whose balance
     /// moved but whose nonce did not arrives without a nonce; each field falls
@@ -273,7 +284,48 @@ impl EthRpc {
                 updates[i].delegate = delegate;
             }
         }
+        let header = self.call("eth_getBlockByNumber", json!([block_hex, false]))?;
+        let credited = withdrawal_addresses_of(&header);
+        for state in self.account_states_at(&credited, block_num)? {
+            match updates.iter_mut().find(|u| u.address == state.address) {
+                Some(u) => *u = state,
+                None => updates.push(state),
+            }
+        }
         Ok(updates)
+    }
+
+    /// Balance, nonce and delegate of each address at the end of `block`.
+    /// Unlike `get_account_states`, a failed read is an error rather than a
+    /// zero.
+    pub fn account_states_at(&self, addresses: &[Vec<u8>], block: u64) -> Result<Vec<AccountUpdate>, String> {
+        let tag = format!("0x{:x}", block);
+        let mut requests: Vec<(&str, Value)> = Vec::with_capacity(3 * addresses.len());
+        for a in addresses {
+            let a = format!("0x{}", hex::encode(a));
+            requests.push(("eth_getBalance", json!([a, tag])));
+            requests.push(("eth_getTransactionCount", json!([a, tag])));
+            requests.push(("eth_getCode", json!([a, tag])));
+        }
+        let mut results = self.batch_raw(&requests)?.into_iter();
+        let mut next = |what: &str, a: &[u8]| -> Result<Value, String> {
+            results
+                .next()
+                .ok_or("short batch")?
+                .map_err(|e| format!("{what} 0x{} at block {block}: {e}", hex::encode(a)))
+        };
+        let mut out = Vec::with_capacity(addresses.len());
+        for a in addresses {
+            let balance = parse_hex_u256(&next("eth_getBalance", a)?);
+            let nonce = parse_hex_u64(&next("eth_getTransactionCount", a)?)?;
+            let code = next("eth_getCode", a)?;
+            let code = code
+                .as_str()
+                .and_then(parse_hex_bytes)
+                .ok_or_else(|| format!("eth_getCode 0x{} returned {code}", hex::encode(a)))?;
+            out.push(AccountUpdate { address: a.clone(), balance, nonce, delegate: delegate_from_code(&code) });
+        }
+        Ok(out)
     }
 
     /// The delegate of each address at the end of `block`, from its code.
@@ -335,6 +387,18 @@ impl EthRpc {
             "address": address,
             "topics": [topic0],
         });
+        let result = self.call("eth_getLogs", json!([filter]))?;
+        result
+            .as_array()
+            .cloned()
+            .ok_or_else(|| "logs result is not an array".into())
+    }
+
+    /// Logs of one block from any contract, matching `topics` (positions
+    /// in order, `null` for any, an array for any of several).
+    pub fn get_logs_matching(&self, block_num: u64, topics: Value) -> Result<Vec<Value>, String> {
+        let block_hex = format!("0x{:x}", block_num);
+        let filter = json!({"fromBlock": block_hex, "toBlock": block_hex, "topics": topics});
         let result = self.call("eth_getLogs", json!([filter]))?;
         result
             .as_array()
@@ -696,6 +760,20 @@ fn parse_hex_u64(val: &Value) -> Result<u64, String> {
     let s = val.as_str().ok_or("expected hex string")?;
     let s = s.strip_prefix("0x").unwrap_or(s);
     u64::from_str_radix(s, 16).map_err(|e| format!("bad hex u64: {}", e))
+}
+
+/// The distinct accounts a block's withdrawals credit, from its
+/// `withdrawals` list (absent before Shanghai).
+fn withdrawal_addresses_of(block: &Value) -> Vec<Vec<u8>> {
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    for w in block.get("withdrawals").and_then(Value::as_array).into_iter().flatten() {
+        if let Some(address) = w.get("address").and_then(Value::as_str).and_then(parse_hex_address) {
+            if !out.contains(&address) {
+                out.push(address);
+            }
+        }
+    }
+    out
 }
 
 /// Bytes as `eth_getCode` and the tracer return them: 0x, then whole bytes.
@@ -1169,6 +1247,27 @@ mod tests {
         assert_eq!(find(&updates, B).delegate, None);
         assert_eq!(unsure.len(), 1);
         assert_eq!(updates[unsure[0]].address, parse_hex_address(A).unwrap());
+    }
+
+    /// A block's withdrawals, in the shape an ethrex node returns them, with
+    /// two to one address.
+    #[test]
+    fn withdrawal_addresses_are_read_from_the_block() {
+        let block = json!({
+            "number": "0x18f7a80",
+            "transactions": [{"from": A, "to": B}],
+            "withdrawals": [
+                {"index": "0x7b1c2a1", "validatorIndex": "0x1d8b3", "address": C, "amount": "0x11d3b4b"},
+                {"index": "0x7b1c2a2", "validatorIndex": "0x1d8b4", "address": C, "amount": "0x11c9f1e"},
+                {"index": "0x7b1c2a3", "validatorIndex": "0x1d8b5", "address": A, "amount": "0x11e0a07"},
+            ]
+        });
+        let credited = withdrawal_addresses_of(&block);
+        assert_eq!(credited, vec![parse_hex_address(C).unwrap(), parse_hex_address(A).unwrap()]);
+        assert!(withdrawal_addresses_of(&json!({"transactions": []})).is_empty());
+        let touched = EthRpc::addresses_from_block(&block);
+        assert_eq!(touched.len(), 3, "withdrawals join from and to, once each");
+        assert!(touched.contains(&parse_hex_address(C).unwrap()));
     }
 
     #[test]
