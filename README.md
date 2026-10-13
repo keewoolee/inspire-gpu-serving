@@ -347,14 +347,29 @@ cargo run --release -p pir-chain --bin resync -- \
     --buckets 134217728
 
 # Serve it. The follower ingests each new block into the sidecar and
-# flips a fresh generation every --rebuild-secs (default 60):
+# flips a fresh generation every --rebuild-secs (default 60). With
+# --checkpoint it also saves the whole table every 50 blocks and starts
+# from that file when it is newer than the CSV:
 cargo run --release -p pir-server -- --accounts-csv accounts.csv \
+    --checkpoint accounts.ckpt \
     --buckets 134217728 --eth-rpc https://RPC-ENDPOINT/KEY
 
 # Look up any address privately:
 cargo run --release -p pir-client -- --server http://HOST:8080 \
     lookup 0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045
 ```
+
+A restart has to land inside the blocks the node can still trace, or the
+blocks before that are followed through transaction from/to only. Loading
+a mainnet CSV takes about four and a half minutes, 22 blocks, so a server
+started from a day-old dump never gets back in. The checkpoint is the
+table as it sits in memory, 16 GB at 2^27 buckets: it saves from a copy
+while the server keeps following, and loads with no parsing or cuckoo
+insertion. Two more things keep a restart rare and cheap. A flip
+builds the next generation only once the one it retired has let go of
+the GPU, so the card never holds three. And a server that is behind
+takes 16 blocks between flips, so the sidecar every lookup carries stays
+a few flips long while it catches up.
 
 ### Delegated code (EIP-7702)
 

@@ -18,8 +18,8 @@
 //! fingerprint>` (see Manifest::stamp_for). Queries are valid against every
 //! generation (the CRS is fixed). /lookup responses are internally
 //! consistent by construction: the queries are answered by the generation
-//! captured at request start (a flip does not interrupt it — the retiring
-//! generation keeps serving its in-flight jobs), and the sidecar store
+//! captured once the body has arrived (a flip does not interrupt it — the
+//! retiring generation keeps serving its in-flight jobs), and the sidecar store
 //! retains entries one flip past their snapshot (see follower), so the
 //! suffix for that generation is still complete even if a flip landed
 //! mid-request.
@@ -64,14 +64,53 @@ pub fn serve(server: Server, state: Arc<ServingState>, workers: usize) {
     }
 }
 
+type Reply = Response<std::io::Cursor<Vec<u8>>>;
+
 fn handle(mut req: tiny_http::Request, state: &ServingState) {
     let url = req.url().to_string();
-    let path = url.split('?').next().unwrap_or("");
+    let path = url.split('?').next().unwrap_or("").to_string();
     let method = req.method().clone();
-    let gen = state.current();
-    let stamp = stamp_header(&gen.stamp);
 
-    let response = match (method, path) {
+    // A query's body is read before a generation is taken, and the reply is
+    // built and the generation let go before it is sent. A generation stays
+    // in GPU memory while any request holds it, so a client slow to upload
+    // or to download would otherwise keep a retired one alive into the next
+    // flip, and three generations do not fit the card.
+    let body = match (&method, path.as_str()) {
+        (Method::Post, "/lookup") | (Method::Post, "/query") => {
+            let queries = if path == "/lookup" { 2 } else { 1 };
+            // The parameters are the same in every generation.
+            let qb = state.current().params.query_packed_bytes();
+            let mut body = Vec::with_capacity(queries * qb);
+            let cap = (queries * qb + 1) as u64;
+            if req.as_reader().take(cap).read_to_end(&mut body).is_err() {
+                respond(req, Response::from_string("read error").with_status_code(400));
+                return;
+            }
+            Some(body)
+        }
+        _ => None,
+    };
+
+    let reply = {
+        let gen = state.current();
+        build_reply(&method, &path, body, &gen, state)
+    };
+    respond(req, reply);
+}
+
+fn build_reply(
+    method: &Method,
+    path: &str,
+    body: Option<Vec<u8>>,
+    gen: &crate::generation::Generation,
+    state: &ServingState,
+) -> Reply {
+    let stamp = stamp_header(&gen.stamp);
+    let fail = |code: u16, msg: String| Response::from_string(msg).with_status_code(code).with_header(stamp_header(&gen.stamp));
+    let body = body.unwrap_or_default();
+
+    match (method, path) {
         (Method::Get, "/healthz") => Response::from_string("ok").with_header(stamp),
 
         (Method::Get, "/manifest") => Response::from_string(gen.manifest_json.clone())
@@ -97,39 +136,20 @@ fn handle(mut req: tiny_http::Request, state: &ServingState) {
 
         (Method::Post, "/lookup") => {
             let qb = gen.params.query_packed_bytes();
-            let mut body = Vec::with_capacity(2 * qb);
-            if req.as_reader().read_to_end(&mut body).is_err() || body.len() != 2 * qb {
-                respond(
-                    req,
-                    Response::from_string(format!("lookup body must be exactly 2x{} bytes", qb))
-                        .with_status_code(400)
-                        .with_header(stamp),
-                );
-                return;
+            if body.len() != 2 * qb {
+                return fail(400, format!("lookup body must be exactly 2x{} bytes", qb));
             }
             let mut flats = Vec::with_capacity(2);
             for half in body.chunks(qb) {
                 match pir_backend_ffi::unpack_query(&gen.params, half) {
                     Ok(f) => flats.push(f),
-                    Err(e) => {
-                        respond(
-                            req,
-                            Response::from_string(e).with_status_code(400).with_header(stamp),
-                        );
-                        return;
-                    }
+                    Err(e) => return fail(400, e),
                 }
             }
 
-            let responses = match answer(&gen, flats) {
+            let responses = match answer(gen, flats) {
                 Ok(r) => r,
-                Err((code, msg)) => {
-                    respond(
-                        req,
-                        Response::from_string(msg).with_status_code(code).with_header(stamp),
-                    );
-                    return;
-                }
+                Err((code, msg)) => return fail(code, msg),
             };
 
             // Queries answered — NOW attach the suffix for the snapshot
@@ -150,55 +170,27 @@ fn handle(mut req: tiny_http::Request, state: &ServingState) {
             for r in &responses {
                 out.extend_from_slice(r);
             }
-            respond(
-                req,
-                Response::from_data(out).with_header(octet_header()).with_header(stamp),
-            );
-            return;
+            Response::from_data(out).with_header(octet_header()).with_header(stamp)
         }
 
         (Method::Post, "/query") => {
-            let expected_bytes = gen.params.query_packed_bytes();
-            let mut body = Vec::with_capacity(expected_bytes);
-            if req.as_reader().read_to_end(&mut body).is_err() {
-                respond(
-                    req,
-                    Response::from_string("read error").with_status_code(400).with_header(stamp),
-                );
-                return;
+            if body.len() != gen.params.query_packed_bytes() {
+                return fail(400, format!("query body must be exactly {} bytes", gen.params.query_packed_bytes()));
             }
             let flat = match pir_backend_ffi::unpack_query(&gen.params, &body) {
                 Ok(f) => f,
-                Err(e) => {
-                    respond(
-                        req,
-                        Response::from_string(e).with_status_code(400).with_header(stamp),
-                    );
-                    return;
-                }
+                Err(e) => return fail(400, e),
             };
-            match answer(&gen, vec![flat]) {
-                Ok(mut responses) => {
-                    respond(
-                        req,
-                        Response::from_data(responses.remove(0))
-                            .with_header(octet_header())
-                            .with_header(stamp),
-                    );
-                }
-                Err((code, msg)) => {
-                    respond(
-                        req,
-                        Response::from_string(msg).with_status_code(code).with_header(stamp),
-                    );
-                }
+            match answer(gen, vec![flat]) {
+                Ok(mut responses) => Response::from_data(responses.remove(0))
+                    .with_header(octet_header())
+                    .with_header(stamp),
+                Err((code, msg)) => fail(code, msg),
             }
-            return;
         }
 
         _ => Response::from_string("not found").with_status_code(404),
-    };
-    respond(req, response);
+    }
 }
 
 fn respond<R: Read>(req: tiny_http::Request, resp: Response<R>) {

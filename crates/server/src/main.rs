@@ -7,7 +7,9 @@
 
 use clap::Parser;
 use pir_keyword::cuckoo::{CuckooParams, CuckooTable, DETERMINISTIC_SEED};
-use pir_server::follower::{self, Checkpoint, Feed, FollowerConfig, SimulatorConfig, TRACE_WINDOW};
+use pir_server::follower::{
+    self, Checkpoint, CheckpointEvery, CheckpointFormat, Feed, FollowerConfig, SimulatorConfig, TRACE_WINDOW,
+};
 use pir_server::generation::{GenerationBuilder, ServingState};
 use pir_server::http::serve;
 use pir_server::names::{read_candidates, read_stealth_registrants, read_stealth_texts, NamesTracker, TrackerConfig};
@@ -36,6 +38,19 @@ struct Args {
     /// restart needs a fresh dump.
     #[clap(long, requires = "storage_csv")]
     checkpoint_secs: Option<u64>,
+
+    /// With --accounts-csv: save the whole table to this file every
+    /// --checkpoint-blocks blocks, as it sits in memory, and start from it
+    /// instead of the CSV when it is newer. It loads without parsing or
+    /// cuckoo insertion, so a restart after a crash stays inside the blocks
+    /// the node can trace.
+    #[clap(long, requires = "accounts_csv")]
+    checkpoint: Option<String>,
+
+    /// How many blocks apart --checkpoint saves are. A save this old, plus
+    /// the restart, has to fit in the node's trace window (128 on ethrex).
+    #[clap(long, default_value_t = 50)]
+    checkpoint_blocks: u64,
 
     /// Serve N synthetic accounts instead of a snapshot.
     #[clap(long)]
@@ -159,11 +174,63 @@ fn main() {
     let mut feed = Feed::Accounts;
     match (&args.accounts_csv, &args.storage_csv, args.synthetic) {
         (Some(csv), _, _) => {
-            let (block, n) = table
-                .build_from_csv(Path::new(csv))
-                .expect("failed to load snapshot CSV");
-            eprintln!("Snapshot: {} accounts at block #{}", n, block);
-            snapshot_block = block;
+            // The newer of the CSV and the checkpoint wins. A checkpoint
+            // that cannot be read is reported and passed over.
+            let csv_block = snapshot_stamp(Path::new(csv));
+            let checkpoint = args.checkpoint.as_ref().map(PathBuf::from).filter(|p| p.exists());
+            let from_checkpoint = checkpoint.and_then(|p| match CuckooTable::checkpoint_block(&p) {
+                Ok(b) if csv_block.map_or(true, |c| b > c) => Some(p),
+                Ok(b) => {
+                    eprintln!("Checkpoint {} is at block #{}, not newer than the CSV", p.display(), b);
+                    None
+                }
+                Err(e) => {
+                    eprintln!("Checkpoint {} cannot be read ({}); loading the CSV", p.display(), e);
+                    None
+                }
+            });
+            let loaded = from_checkpoint.and_then(|p| {
+                let t = Instant::now();
+                match CuckooTable::read_checkpoint(&p) {
+                    Ok((t2, block)) if t2.params.num_buckets == args.buckets => {
+                        let n: usize = t2.used.iter().map(|&u| u as usize).sum();
+                        eprintln!(
+                            "Checkpoint: {} accounts at block #{} from {} in {:.1}s",
+                            n,
+                            block,
+                            p.display(),
+                            t.elapsed().as_secs_f64()
+                        );
+                        Some((t2, block))
+                    }
+                    Ok((t2, _)) => {
+                        eprintln!(
+                            "Checkpoint {} has {} buckets, not {}; loading the CSV",
+                            p.display(),
+                            t2.params.num_buckets,
+                            args.buckets
+                        );
+                        None
+                    }
+                    Err(e) => {
+                        eprintln!("Checkpoint {} cannot be read ({}); loading the CSV", p.display(), e);
+                        None
+                    }
+                }
+            });
+            match loaded {
+                Some((t2, block)) => {
+                    table = t2;
+                    snapshot_block = block;
+                }
+                None => {
+                    let (block, n) = table
+                        .build_from_csv(Path::new(csv))
+                        .expect("failed to load snapshot CSV");
+                    eprintln!("Snapshot: {} accounts at block #{}", n, block);
+                    snapshot_block = block;
+                }
+            }
         }
         (None, Some(csv), _) => {
             if let Some(url) = &args.eth_rpc {
@@ -387,10 +454,19 @@ fn main() {
             rebuild_every: Duration::from_secs(args.rebuild_secs),
             poll_every: Duration::from_secs(3),
             feed,
-            checkpoint: args.checkpoint_secs.map(|secs| Checkpoint {
-                path: PathBuf::from(args.storage_csv.as_ref().unwrap()),
-                every: Duration::from_secs(secs),
-            }),
+            checkpoint: match (&args.checkpoint, args.checkpoint_secs) {
+                (Some(path), _) => Some(Checkpoint {
+                    path: PathBuf::from(path),
+                    every: CheckpointEvery::Blocks(args.checkpoint_blocks.max(1)),
+                    format: CheckpointFormat::Binary,
+                }),
+                (None, Some(secs)) => Some(Checkpoint {
+                    path: PathBuf::from(args.storage_csv.as_ref().unwrap()),
+                    every: CheckpointEvery::Time(Duration::from_secs(secs)),
+                    format: CheckpointFormat::StorageCsv,
+                }),
+                (None, None) => None,
+            },
         };
         std::thread::spawn(move || follower::run(rpc, builder, state2, snapshot_block, cfg));
         eprintln!(
@@ -415,16 +491,20 @@ fn main() {
 /// before loading, so a restart after a long outage fails at once and says a
 /// fresh dump is needed, rather than loading gigabytes and then serving stale
 /// values.
-fn refuse_unreachable_snapshot(csv: &Path, url: &str) {
-    let stamp = std::fs::File::open(csv).ok().and_then(|f| {
+/// The block a snapshot CSV is stamped with, from its first lines.
+fn snapshot_stamp(csv: &Path) -> Option<u64> {
+    std::fs::File::open(csv).ok().and_then(|f| {
         BufReader::new(f)
             .lines()
             .take(8)
             .map_while(Result::ok)
             .find_map(|line| line.trim().strip_prefix("# block=")?.trim().parse::<u64>().ok())
-    });
+    })
+}
+
+fn refuse_unreachable_snapshot(csv: &Path, url: &str) {
     // A file without a stamp is the loader's to reject, with its own message.
-    let Some(block) = stamp else { return };
+    let Some(block) = snapshot_stamp(csv) else { return };
     match pir_chain::rpc::EthRpc::new(url).block_number() {
         Ok(head) if head.saturating_sub(block + 1) >= TRACE_WINDOW => {
             eprintln!(

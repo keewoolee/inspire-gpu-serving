@@ -774,6 +774,112 @@ impl CuckooTable {
         Ok(written)
     }
 
+    // ========================================================================
+    // Binary checkpoints
+    // ========================================================================
+
+    /// Save the whole table, cells as they sit, with the block it reflects.
+    /// Loading it back needs no parsing or cuckoo insertion, so a server
+    /// restarts from one in about the time it takes to read the file, which
+    /// keeps a restart inside the window a node can trace. Returns the bytes
+    /// written.
+    pub fn write_checkpoint(&self, path: &Path, block: u64) -> io::Result<u64> {
+        use std::io::Write;
+        let mut w = std::io::BufWriter::with_capacity(64 << 20, File::create(path)?);
+        let p = &self.params;
+        w.write_all(CHECKPOINT_MAGIC)?;
+        w.write_all(&block.to_le_bytes())?;
+        for n in [p.num_buckets as u64, p.key_size as u64, p.value_size as u64, p.bucket_capacity as u64] {
+            w.write_all(&n.to_le_bytes())?;
+        }
+        for n in [p.num_hashes as u64, p.max_evictions as u64] {
+            w.write_all(&n.to_le_bytes())?;
+        }
+        w.write_all(&p.seed)?;
+        w.write_all(&[match p.key_derivation {
+            KeyDerivation::Address => 0u8,
+            KeyDerivation::Keccak => 1,
+            KeyDerivation::Storage => 2,
+        }])?;
+        w.write_all(&(p.contracts.len() as u64).to_le_bytes())?;
+        for c in &p.contracts {
+            w.write_all(c)?;
+        }
+        w.write_all(&(p.content.len() as u64).to_le_bytes())?;
+        w.write_all(p.content.as_bytes())?;
+        w.write_all(&(self.data.len() as u64).to_le_bytes())?;
+        w.write_all(&self.data)?;
+        w.write_all(&(self.used.len() as u64).to_le_bytes())?;
+        w.write_all(&self.used)?;
+        w.write_all(&(self.stash.len() as u64).to_le_bytes())?;
+        for cell in &self.stash {
+            w.write_all(&(cell.len() as u64).to_le_bytes())?;
+            w.write_all(cell)?;
+        }
+        w.flush()?;
+        w.get_ref().sync_all()?;
+        Ok(w.get_ref().metadata()?.len())
+    }
+
+    /// The block a checkpoint reflects, from its header alone.
+    pub fn checkpoint_block(path: &Path) -> io::Result<u64> {
+        let mut r = BufReader::new(File::open(path)?);
+        read_magic(&mut r)?;
+        read_u64(&mut r)
+    }
+
+    /// Load a checkpoint written by `write_checkpoint`: the table and the
+    /// block it reflects.
+    pub fn read_checkpoint(path: &Path) -> io::Result<(CuckooTable, u64)> {
+        use std::io::Read;
+        let mut r = BufReader::with_capacity(64 << 20, File::open(path)?);
+        read_magic(&mut r)?;
+        let block = read_u64(&mut r)?;
+        let mut n = [0usize; 6];
+        for v in n.iter_mut() {
+            *v = read_u64(&mut r)? as usize;
+        }
+        let [num_buckets, key_size, value_size, bucket_capacity, num_hashes, max_evictions] = n;
+        let mut seed = [0u8; 16];
+        r.read_exact(&mut seed)?;
+        let mut derivation = [0u8; 1];
+        r.read_exact(&mut derivation)?;
+        let key_derivation = match derivation[0] {
+            0 => KeyDerivation::Address,
+            1 => KeyDerivation::Keccak,
+            2 => KeyDerivation::Storage,
+            other => return Err(invalid(format!("unknown key derivation {other}"))),
+        };
+        let mut contracts = Vec::new();
+        for _ in 0..read_u64(&mut r)? {
+            let mut c = [0u8; 20];
+            r.read_exact(&mut c)?;
+            contracts.push(c);
+        }
+        let content = String::from_utf8(read_bytes(&mut r)?).map_err(|e| invalid(e.to_string()))?;
+        let mut params = CuckooParams::new(num_buckets, key_size, value_size, seed);
+        params.bucket_capacity = bucket_capacity;
+        params.num_hashes = num_hashes;
+        params.max_evictions = max_evictions;
+        params.key_derivation = key_derivation;
+        params.contracts = contracts;
+        params.content = content;
+        if params.cell_size() > MAX_CELL_SIZE {
+            return Err(invalid("cells larger than this build supports".into()));
+        }
+        let data = read_bytes(&mut r)?;
+        let used = read_bytes(&mut r)?;
+        if data.len() != num_buckets * params.bucket_bytes() || used.len() != num_buckets {
+            return Err(invalid("table size does not match its parameters".into()));
+        }
+        let mut stash = Vec::new();
+        for _ in 0..read_u64(&mut r)? {
+            stash.push(read_bytes(&mut r)?);
+        }
+        let hasher = CuckooHash::new(&params);
+        Ok((CuckooTable { params, hasher, data, used, stash }, block))
+    }
+
     /// Export all occupied cells to CSV format: `address,nonce,balance_wei,delegate`.
     /// First line is `# block=BLOCK_NUMBER`, second line is the header.
     pub fn export_csv(&self, path: &Path, block_number: u64) -> io::Result<usize> {
@@ -807,6 +913,35 @@ impl CuckooTable {
         );
         Ok(count)
     }
+}
+
+/// Marks a binary table checkpoint, and its format version.
+const CHECKPOINT_MAGIC: &[u8; 10] = b"PIRTABLE1\n";
+
+fn invalid(what: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, what)
+}
+
+fn read_magic(r: &mut impl io::Read) -> io::Result<()> {
+    let mut magic = [0u8; 10];
+    r.read_exact(&mut magic)?;
+    if &magic != CHECKPOINT_MAGIC {
+        return Err(invalid("not a table checkpoint".into()));
+    }
+    Ok(())
+}
+
+fn read_u64(r: &mut impl io::Read) -> io::Result<u64> {
+    let mut b = [0u8; 8];
+    r.read_exact(&mut b)?;
+    Ok(u64::from_le_bytes(b))
+}
+
+fn read_bytes(r: &mut impl io::Read) -> io::Result<Vec<u8>> {
+    let len = read_u64(r)? as usize;
+    let mut out = vec![0u8; len];
+    r.read_exact(&mut out)?;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -937,6 +1072,38 @@ mod tests {
         assert_eq!(nonce, 5);
 
         std::fs::remove_file(&csv_path).ok();
+    }
+
+    /// A checkpoint loads back into the same table, parameters, cells, stash
+    /// and all, and a file that is not one is refused.
+    #[test]
+    fn checkpoint_round_trips() {
+        let mut params = CuckooParams::new(64, 20, 40, DETERMINISTIC_SEED);
+        params.key_derivation = KeyDerivation::Keccak;
+        params.contracts = vec![[7u8; 20]];
+        params.content = "names".into();
+        let mut table = CuckooTable::new(params);
+        for i in 0..80 {
+            table.insert(&address_from_index(i), &initial_value(i));
+        }
+        table.stash.push(vec![9u8; 60]);
+        let path = std::env::temp_dir().join(format!("table-checkpoint-{}", std::process::id()));
+        table.write_checkpoint(&path, 1234).unwrap();
+        assert_eq!(CuckooTable::checkpoint_block(&path).unwrap(), 1234);
+        let (back, block) = CuckooTable::read_checkpoint(&path).unwrap();
+        assert_eq!(block, 1234);
+        assert_eq!(back.data, table.data);
+        assert_eq!(back.used, table.used);
+        assert_eq!(back.stash, table.stash);
+        assert_eq!(back.params.key_derivation, KeyDerivation::Keccak);
+        assert_eq!(back.params.contracts, vec![[7u8; 20]]);
+        assert_eq!(back.params.content, "names");
+        for i in 0..80 {
+            assert_eq!(back.lookup(&address_from_index(i)), table.lookup(&address_from_index(i)));
+        }
+        std::fs::write(&path, b"address,nonce,balance_wei\n").unwrap();
+        assert!(CuckooTable::checkpoint_block(&path).is_err());
+        std::fs::remove_file(&path).ok();
     }
 
     /// A delegate column fills the first twenty bytes, an empty cell leaves

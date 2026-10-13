@@ -2,13 +2,13 @@
 //! and periodically rebuild + flip the generation. Two sources: the real
 //! chain (JSON-RPC) or a simulator (random updates on a block clock).
 
-use crate::generation::{GenerationBuilder, ServingState};
+use crate::generation::{Generation, GenerationBuilder, ServingState};
 use crate::names::NamesTracker;
 use pir_chain::rpc::{account_update_to_value, EthRpc};
 use pir_keyword::cuckoo::address_from_index;
 use pir_keyword::storage::storage_value;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -16,6 +16,12 @@ use std::time::{Duration, Instant};
 /// has no other source of changes, so once the next block it needs is older
 /// than this, it can never catch up again and needs a fresh dump.
 pub const TRACE_WINDOW: u64 = 128;
+
+/// Blocks taken before the flip timer is looked at again. A server far behind
+/// the chain keeps flipping while it catches up, so its sidecar, which every
+/// lookup carries whole, holds a few flips' worth of changes rather than all
+/// of the catch-up.
+const BLOCKS_PER_PASS: u64 = 16;
 
 pub struct FollowerConfig {
     /// Rebuild + flip the generation this often.
@@ -28,31 +34,82 @@ pub struct FollowerConfig {
     pub checkpoint: Option<Checkpoint>,
 }
 
-/// Where and how often a storage table saves itself. The file is the one the
-/// server starts from, replaced whole so a crash mid-write leaves the last
-/// complete save. A restart within the trace window of the last save picks up
-/// where it left off; a longer outage needs a fresh dump.
+/// Where and how often a table saves itself, replacing the file whole so a
+/// crash mid-write leaves the last complete save. A restart within the trace
+/// window of the last save picks up where it left off; a longer outage needs
+/// a fresh dump.
 pub struct Checkpoint {
     pub path: PathBuf,
-    pub every: Duration,
+    pub every: CheckpointEvery,
+    pub format: CheckpointFormat,
 }
 
-/// Save a copy of the table as of `block` over the snapshot file.
-fn save_checkpoint(table: &pir_keyword::cuckoo::CuckooTable, path: &PathBuf, block: u64) {
+pub enum CheckpointEvery {
+    Time(Duration),
+    /// Counted in blocks, which is how the trace window is counted: a save
+    /// at most this many blocks old, plus the restart, has to fit inside it.
+    Blocks(u64),
+}
+
+pub enum CheckpointFormat {
+    /// A storage snapshot CSV, saved over the file the server started from.
+    StorageCsv,
+    /// The table as it sits in memory (`CuckooTable::write_checkpoint`).
+    Binary,
+}
+
+/// Save a copy of the table as of `block`.
+fn save_checkpoint(table: &pir_keyword::cuckoo::CuckooTable, cp_path: &PathBuf, binary: bool, block: u64) {
     let t0 = Instant::now();
-    let partial = PathBuf::from(format!("{}.partial", path.display()));
-    let saved = table
-        .write_storage_csv(&partial, block)
-        .and_then(|n| std::fs::rename(&partial, path).map(|_| n));
-    match saved {
-        Ok(n) => eprintln!(
-            "checkpoint: {} slots at block #{} saved to {} in {:.1}s",
-            n,
+    let partial = PathBuf::from(format!("{}.partial", cp_path.display()));
+    let written = if binary {
+        table.write_checkpoint(&partial, block).map(|bytes| format!("{:.1} GB", bytes as f64 / 1e9))
+    } else {
+        table.write_storage_csv(&partial, block).map(|n| format!("{n} slots"))
+    };
+    match written.and_then(|what| std::fs::rename(&partial, cp_path).map(|_| what)) {
+        Ok(what) => eprintln!(
+            "checkpoint: {} at block #{} saved to {} in {:.1}s",
+            what,
             block,
-            path.display(),
+            cp_path.display(),
             t0.elapsed().as_secs_f64()
         ),
         Err(e) => eprintln!("checkpoint at block #{} failed: {}", block, e),
+    }
+}
+
+/// The generation the last flip retired, until its GPU memory is free. The
+/// next generation is built only then, so the card never holds three: the
+/// retired one answers what it already received and lets go, and a request
+/// holds a generation only while its reply is built.
+#[derive(Default)]
+struct Retired {
+    gpu: Option<Weak<()>>,
+    waiting_since: Option<Instant>,
+}
+
+impl Retired {
+    fn hold(&mut self, gen: Arc<Generation>) {
+        self.gpu = Some(gen.gpu_held.clone());
+    }
+
+    /// Whether the GPU is free for the next generation. A wait that is not
+    /// over at once is logged when it ends.
+    fn released(&mut self) -> bool {
+        let held = self.gpu.as_ref().is_some_and(|w| w.upgrade().is_some());
+        if held {
+            self.waiting_since.get_or_insert_with(Instant::now);
+            return false;
+        }
+        self.gpu = None;
+        if let Some(t) = self.waiting_since.take() {
+            eprintln!(
+                "retired generation released the GPU after {:.1}s more; building the next one",
+                t.elapsed().as_secs_f64()
+            );
+        }
+        true
     }
 }
 
@@ -173,6 +230,10 @@ pub fn run(
     let backoff = |streak: u32| Duration::from_secs((1u64 << streak.min(6)).min(60));
     let mut last_checkpoint = Instant::now();
     let mut checkpoint_writer: Option<JoinHandle<()>> = None;
+    // Whether the last pass stopped short of the chain head.
+    let mut behind = false;
+    let mut retired = Retired::default();
+    let mut last_checkpoint_block = start_block;
 
     loop {
         // 1. Pull new blocks into the sidecar + host truth.
@@ -212,7 +273,8 @@ pub fn run(
         } else {
             match rpc.block_number() {
                 Ok(head) if head > synced_to => {
-                    for b in (synced_to + 1)..=head {
+                    behind = head > synced_to + BLOCKS_PER_PASS;
+                    for b in (synced_to + 1)..=head.min(synced_to + BLOCKS_PER_PASS) {
                         match ingest_block(&rpc, &cfg.feed, b, &builder, &state) {
                             Ok(changes) => {
                                 fail_streak = 0;
@@ -255,31 +317,33 @@ pub fn run(
                                     wait.as_secs()
                                 );
                                 std::thread::sleep(wait);
+                                behind = false;
                                 break;
                             }
                         }
                     }
                 }
-                Ok(_) => {}
+                Ok(_) => behind = false,
                 Err(e) => {
                     fail_streak += 1;
                     let wait = backoff(fail_streak);
                     eprintln!("block_number failed: {} (backing off {}s)", e, wait.as_secs());
                     std::thread::sleep(wait);
+                    behind = false;
                 }
             }
         }
 
         // 2. Periodic generation flip: rebuild from the maintained truth,
         //    swap, truncate the sidecar through the retiring snapshot.
-        if last_rebuild.elapsed() >= cfg.rebuild_every {
+        if last_rebuild.elapsed() >= cfg.rebuild_every && retired.released() {
             let next = {
                 let mut bld = builder.lock().unwrap();
                 bld.build(synced_to)
             };
             match next {
                 Ok(g) => {
-                    state.swap(g);
+                    retired.hold(state.swap(g));
                     // One-flip retention lag: in-flight lookups answered by
                     // the retiring generation still need its suffix.
                     state.sidecar.truncate_through(serving_snapshot);
@@ -296,13 +360,19 @@ pub fn run(
                     // state at `synced_to`.
                     let writer_idle = checkpoint_writer.as_ref().map_or(true, |w| w.is_finished());
                     if let Some(cp) = &cfg.checkpoint {
-                        if last_checkpoint.elapsed() >= cp.every && writer_idle {
+                        let due = match cp.every {
+                            CheckpointEvery::Time(every) => last_checkpoint.elapsed() >= every,
+                            CheckpointEvery::Blocks(n) => synced_to >= last_checkpoint_block + n,
+                        };
+                        if due && writer_idle {
                             let table = builder.lock().unwrap().table.clone();
                             let (path, block) = (cp.path.clone(), synced_to);
+                            let binary = matches!(cp.format, CheckpointFormat::Binary);
                             checkpoint_writer = Some(std::thread::spawn(move || {
-                                save_checkpoint(&table, &path, block)
+                                save_checkpoint(&table, &path, binary, block)
                             }));
                             last_checkpoint = Instant::now();
+                            last_checkpoint_block = synced_to;
                         }
                     }
                 }
@@ -315,7 +385,10 @@ pub fn run(
             }
         }
 
-        std::thread::sleep(cfg.poll_every);
+        // A server still catching up goes straight on to the next pass.
+        if !behind {
+            std::thread::sleep(cfg.poll_every);
+        }
     }
 }
 
@@ -360,6 +433,7 @@ pub fn run_simulated(
     let mut last_rebuild = Instant::now();
     // One-flip retention lag, as in `run`.
     let mut serving_snapshot = start_block;
+    let mut retired = Retired::default();
 
     loop {
         std::thread::sleep(Duration::from_secs(cfg.block_secs));
@@ -388,14 +462,14 @@ pub fn run_simulated(
             state.sidecar.len()
         );
 
-        if last_rebuild.elapsed() >= cfg.rebuild_every {
+        if last_rebuild.elapsed() >= cfg.rebuild_every && retired.released() {
             let next = {
                 let mut bld = builder.lock().unwrap();
                 bld.build(block)
             };
             match next {
                 Ok(g) => {
-                    state.swap(g);
+                    retired.hold(state.swap(g));
                     state.sidecar.truncate_through(serving_snapshot);
                     serving_snapshot = block;
                     last_rebuild = Instant::now();

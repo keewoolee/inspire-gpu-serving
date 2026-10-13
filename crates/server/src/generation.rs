@@ -19,7 +19,7 @@ use pir_keyword::manifest::{CuckooManifest, Manifest, StashEntry, StealthEntry, 
 use pir_keyword::slots::{slot_db_cols, to_slot_db, write_bucket_to_slot_db};
 use pir_keyword::storage::storage_key;
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 /// One live generation, shared with the HTTP workers.
@@ -38,6 +38,9 @@ pub struct Generation {
     pub stamp: String,
     /// Channel into this generation's scheduler thread.
     pub jobs: Sender<QueryJob>,
+    /// Alive until this generation's GPU memory is freed, which happens once
+    /// the last request holding it is done and its scheduler thread exits.
+    pub gpu_held: Weak<()>,
 }
 
 /// What the HTTP layer sees: the current generation (swappable) + sidecar.
@@ -71,8 +74,10 @@ impl ServingState {
     /// callers truncate the sidecar only through the RETIRING generation's
     /// snapshot (one-flip retention lag): lookups the old generation is
     /// still answering need its suffix to remain complete.
-    pub fn swap(&self, next: Generation) {
-        *self.current.write().unwrap() = Arc::new(next);
+    /// Returns the retired generation, so the caller can tell when its GPU
+    /// memory is free.
+    pub fn swap(&self, next: Generation) -> Arc<Generation> {
+        std::mem::replace(&mut *self.current.write().unwrap(), Arc::new(next))
     }
 }
 
@@ -223,7 +228,9 @@ impl GenerationBuilder {
             pir: srv.params().to_manifest(),
         };
         let params = *srv.params();
-        let (jobs, _handle) = scheduler::spawn(srv, self.max_batch, self.window);
+        let gpu_token = Arc::new(());
+        let gpu_held = Arc::downgrade(&gpu_token);
+        let (jobs, _handle) = scheduler::spawn(srv, self.max_batch, self.window, gpu_token);
         Ok(Generation {
             manifest_json: manifest.to_json(),
             stamp: manifest.stamp_for(snapshot_block),
@@ -232,6 +239,7 @@ impl GenerationBuilder {
             snapshot_block,
             stash,
             jobs,
+            gpu_held,
         })
     }
 }

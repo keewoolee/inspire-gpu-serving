@@ -10,6 +10,7 @@
 
 use pir_backend_ffi::GpuServer;
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -24,13 +25,21 @@ pub struct QueryJob {
 
 /// Move the server into its scheduler thread; the returned Sender is the only
 /// way to reach the GPU from then on. Dropping every Sender stops the thread.
+/// Start a generation's scheduler thread. It runs until every sender is
+/// gone, then drops the GPU handle, which frees the generation's GPU memory,
+/// and only then drops `gpu_token`, so whoever holds a `Weak` to the token
+/// can tell when that memory is free.
 pub fn spawn(
     srv: GpuServer,
     max_batch: usize,
     window: Duration,
+    gpu_token: Arc<()>,
 ) -> (Sender<QueryJob>, JoinHandle<()>) {
     let (tx, rx) = channel::<QueryJob>();
-    let handle = std::thread::spawn(move || run(srv, rx, max_batch, window));
+    let handle = std::thread::spawn(move || {
+        run(srv, rx, max_batch, window);
+        drop(gpu_token);
+    });
     (tx, handle)
 }
 
